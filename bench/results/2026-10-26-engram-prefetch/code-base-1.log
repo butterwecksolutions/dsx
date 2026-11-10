@@ -1,0 +1,12 @@
+Running as unit: ds41-pf-code-base-1.scope; invocation ID: 86d01d87f70c46fba8f9d700ba1ad0a7
+GPU0 NVIDIA GeForce RTX 3090: 25.4 GB, host link 24.6 GB/s (main)
+GPU1 NVIDIA GeForce RTX 3090: 25.4 GB, host link 3.3 GB/s
+experts resident: GPU0 1048 (8.9 GB), GPU1 2705 (22.9 GB, static, 3.3 GB/s link)
+host buffer: 99.3 GB faulted in, 2.0 s waiting on memory pressure
+arena: 99.3 GB allocated and pinned in 36.4 s
+arena: 11607 experts, 99.3 GB in 53 s; 0 left in the file
+{"event":"prefill_bench","round":0,"warm":false,"new_tokens":8000,"cached_tokens":0,"chunk":8192,"ctx":262144,"elapsed_s":10.087234996,"tok_s":793.0815533862676,"logit_fingerprint":"9232e11ebcb89ad5"}
+{"event":"prefill_bench","round":1,"warm":true,"new_tokens":8000,"cached_tokens":0,"chunk":8192,"ctx":262144,"elapsed_s":8.695397336,"tok_s":920.0269626413769,"logit_fingerprint":"9232e11ebcb89ad5"}
+{"event":"prefill_bench","round":2,"warm":true,"new_tokens":8000,"cached_tokens":0,"chunk":8192,"ctx":262144,"elapsed_s":8.716427238,"tok_s":917.8072370206138,"logit_fingerprint":"9232e11ebcb89ad5"}
+{"event":"summary","warm_rounds":2,"new_tokens":16000,"elapsed_s":17.411824574,"warm_tok_s":918.9157593450493}
+RC 0

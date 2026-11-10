@@ -270,8 +270,10 @@ impl CpuMoe {
                 let i = e * MAX_TOKENS + j;
                 for (a, k) in [(&mut s.ag[i], dim), (&mut s.au[i], dim), (&mut s.ad[i], inter)] {
                     a.x4.resize(k / 2, 0);
+                    a.x8.resize(k / 2, 0);
                     if super::t16k::mul1() {
                         a.x1.resize(k, 0);
+                        a.xm1.resize(k, 0);
                     }
                     a.d.resize(k / 256, 0.0);
                     a.s.resize(k / 256, 0);
@@ -669,6 +671,8 @@ mod tests {
         use GType::*;
         [
             (Q2_0, Q3K),
+            (Iq1S, Q2K),
+            (Iq2S, Iq3Xxs),
             (Ptq1_0, Q2_0),
             (Q3K, Ptq1_0),
             (Q2_0, Q2_0),

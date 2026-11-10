@@ -1,0 +1,106 @@
+name: ci
+
+# Runs on every pull request (from forks too: the token is read-only and no secrets are used),
+# and on pushes to main so the cache is warm and merges are verified.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # one run per PR/ref; a new push cancels the previous run
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  # .cargo/config.toml pins -C target-cpu=native, but hosted runners mix Intel and AMD CPUs and the dependency cache
+  # moves between them: build for a fixed baseline instead (the VNNI / AVX-512 kernels dispatch at run time).
+  RUSTFLAGS: -C target-cpu=x86-64-v3
+
+jobs:
+  # Cheap gate: does the whole workspace (core + nvidia + amd) compile, including all test targets.
+  # amd only compiles here: linking dsx-amd needs libamdhip64/libhipblas from /opt/rocm.
+  check:
+    name: build (workspace, no GPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          shared-key: check
+          # forks/PRs only restore the cache, they never write it
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
+
+  # The CPU test suite: core (formats, t16, numerics, server) + the nvidia crate's CPU paths
+  # (qdot/quantize SIMD kernels, prefix cache, session policy) + tests/engram_gather.rs.
+  # The gpu_* integration tests are `#![cfg(feature = "cuda")]`, so without the feature they are empty.
+  # --release matters: the SIMD kernel tests take ~13 min in debug and ~2.5 min in release.
+  # nvidia/tests/engram_gather.rs checks page-cache eviction via posix_fadvise(DONTNEED): it holds on ext4
+  # (hosted runners) but not on tmpfs. If it ever flakes, append -- --skip rows_land_in_place_every_token.
+  test:
+    name: cargo test (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo test
+        # dsx-amd is excluded: it links -lamdhip64/-lhipblas, which a hosted runner does not have.
+        run: cargo test --locked --release --no-fail-fast -p dsx-core -p dsx --all-targets
+
+  # Hosted runners have no GPU, so the CUDA kernels can only be compiled here, not executed.
+  # Still catches broken kernels (nvcc), cudarc API drift and the `required-features = ["cuda"]` bins.
+  # CUDA 13.x is needed for sm_120 (RTX 5090); the action installs only nvcc + cudart headers.
+  cuda-compile:
+    name: compile CUDA feature (nvcc, no GPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - name: install CUDA toolkit (nvcc + headers)
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '13.2.0'
+          method: 'network'
+          sub-packages: '["nvcc","cudart-dev"]'
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          shared-key: cuda
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo check -p dsx --features cuda --all-targets
+        # nvidia/build.rs compiles src/kernels/dsx.cu for sm_86 and sm_120 (CUDA_ARCHS default).
+        # cudarc is pinned to its `cuda-13000` feature in nvidia/Cargo.toml.
+        run: cargo check --locked --release -p dsx --features cuda --all-targets
+
+  # Once a self-hosted runner with a GPU is registered, uncomment this job (labels: self-hosted + gpu).
+  # The GPU tests need a real device: cargo test --release --features cuda -p dsx --all-targets
+  #
+  # gpu-test:
+  #   name: cargo test (GPU, self-hosted)
+  #   runs-on: [self-hosted, linux, gpu]
+  #   timeout-minutes: 60
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #     - run: cargo test --locked --release --features cuda -p dsx --all-targets

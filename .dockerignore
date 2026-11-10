@@ -1,0 +1,18 @@
+.git
+.gitignore
+.github
+
+# build outputs
+target
+nvidia/target
+amd/target
+
+# model exports downloaded beside the repo (README: `hf download ... --local-dir dsx-t16`)
+dsx-t16
+dsx-mxfp4
+v41-1017
+*.gguf
+*.safetensors
+*.bin
+
+*.log

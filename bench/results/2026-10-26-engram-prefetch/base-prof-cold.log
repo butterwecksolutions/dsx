@@ -1,0 +1,23 @@
+Running as unit: ds41-pf-base-prof-cold.scope; invocation ID: 2ff215927d8e44db9bbdfb6078c195aa
+GPU0 NVIDIA GeForce RTX 3090: 25.4 GB, host link 24.6 GB/s (main)
+GPU1 NVIDIA GeForce RTX 3090: 25.4 GB, host link 3.3 GB/s
+experts resident: GPU0 1048 (8.9 GB), GPU1 2705 (22.9 GB, static, 3.3 GB/s link)
+arena: 99.3 GB allocated and pinned in 35.4 s
+arena: 11607 experts, 99.3 GB in 52 s; 0 left in the file
+engram L1: 192000 rows, 38373 distinct
+engram L1: hash 2 ms, gather 205 ms, upload 21 ms
+engram L14: 192000 rows, 38375 distinct
+engram L14: hash 2 ms, gather 201 ms, upload 21 ms
+{"event":"prefill_bench","round":0,"warm":false,"new_tokens":8000,"cached_tokens":0,"chunk":8192,"ctx":262144,"elapsed_s":8.755110874,"tok_s":913.7519918517025,"logit_fingerprint":"3cefc10807d80588"}
+engram L1: 192000 rows, 38373 distinct
+engram L1: hash 2 ms, gather 78 ms, upload 21 ms
+engram L14: 192000 rows, 38375 distinct
+engram L14: hash 2 ms, gather 77 ms, upload 21 ms
+{"event":"prefill_bench","round":1,"warm":true,"new_tokens":8000,"cached_tokens":0,"chunk":8192,"ctx":262144,"elapsed_s":8.006114218,"tok_s":999.2363064236264,"logit_fingerprint":"3cefc10807d80588"}
+engram L1: 192000 rows, 38373 distinct
+engram L1: hash 2 ms, gather 78 ms, upload 21 ms
+engram L14: 192000 rows, 38375 distinct
+engram L14: hash 2 ms, gather 78 ms, upload 21 ms
+{"event":"prefill_bench","round":2,"warm":true,"new_tokens":8000,"cached_tokens":0,"chunk":8192,"ctx":262144,"elapsed_s":8.020899362,"tok_s":997.3943867069305,"logit_fingerprint":"3cefc10807d80588"}
+{"event":"summary","warm_rounds":2,"new_tokens":16000,"elapsed_s":16.027013580000002,"warm_tok_s":998.3144969669389}
+RC 0

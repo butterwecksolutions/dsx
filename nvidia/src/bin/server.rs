@@ -61,6 +61,9 @@ struct Cli {
     model: Option<PathBuf>,
     #[arg(long)]
     engram: Option<PathBuf>,
+    /// a GGUF of replacement tensors laid over the model's, e.g. an abliterated build's few edited matrices
+    #[arg(long, env = "DSX_OVERLAY")]
+    overlay: Option<PathBuf>,
     #[arg(long, default_value_t = 4096)]
     chunk: usize,
     /// GB of routed experts on the main GPU (picked by host-link bandwidth); negative = its free memory minus that
@@ -81,6 +84,23 @@ struct Cli {
     /// text only: don't load the vision weights even if `vision.safetensors` sits next to the model
     #[arg(long)]
     no_vision: bool,
+    /// most LLM tokens one image may cost; larger images are scaled down to fit. 1024 is DeepSeek's
+    /// `vision_max_n_token`; more keeps finer detail on big images but goes beyond what the model was tuned on
+    #[arg(long, env = "DSX_VISION_MAX_TOKENS", default_value_t = dsx_core::vision::MAX_TOKENS)]
+    vision_max_tokens: usize,
+    /// conversation lineages kept for prefix reuse, including the active one. `1` (default) is the current
+    /// single-lineage behaviour with no host parking; `>1` parks inactive lineages in the host cache so `A -> B -> A`
+    /// resumes instead of prefilling from token 0.
+    #[arg(long, default_value_t = 1)]
+    cache_sessions: usize,
+    /// hard budget for the host cache of inactive lineages, decimal GB (committed arena memory and the logical host
+    /// payload never exceed it). Ignored with `--cache-sessions 1`.
+    #[arg(long, default_value_t = 8.0)]
+    session_cache_gb: f64,
+    /// periodic sparse prefix-anchor interval in prompt tokens (`0` disables anchors): a new agent that shares a
+    /// long system/tools prefix can replay only the divergent tail from an earlier anchor.
+    #[arg(long, default_value_t = 16384)]
+    prefix_anchor_tokens: usize,
 }
 
 #[tokio::main]
@@ -100,8 +120,38 @@ async fn main() -> Result<()> {
         let dir = cli.model.as_ref().and_then(|m| if m.is_dir() { Some(m.clone()) } else { m.parent().map(|p| p.to_path_buf()) });
         cli.vision = dir.map(|d| d.join("vision.safetensors")).filter(|p| p.is_file());
     }
+    if cli.vision_max_tokens < 4 {
+        anyhow::bail!("--vision-max-tokens {}: an image needs at least 4", cli.vision_max_tokens);
+    }
+    dsx_core::vision::set_max_tokens(cli.vision_max_tokens);
     if let Some(v) = &cli.vision {
-        tracing::info!("vision: {}", v.display());
+        tracing::info!("vision: {} (at most {} tokens per image)", v.display(), cli.vision_max_tokens);
+    }
+    if cli.cache_sessions > 1 {
+        tracing::info!(
+            "session cache: {} lineages, {:.1} GB host budget, prefix anchor every {} tokens",
+            cli.cache_sessions,
+            cli.session_cache_gb,
+            cli.prefix_anchor_tokens
+        );
+        // the cache's pinned slabs come on top of the expert arena: refuse a budget that cannot fit next to it
+        let avail_gb = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok()))
+            .map(|kb| kb / 1e6);
+        if let Some(avail) = avail_gb {
+            let need = cli.arena_gb + cli.session_cache_gb + 8.0;
+            if need > avail {
+                return Err(anyhow!(
+                    "--arena-gb {} + --session-cache-gb {} + 8 GB headroom = {need:.0} GB exceeds the {avail:.0} GB of available RAM",
+                    cli.arena_gb,
+                    cli.session_cache_gb
+                ));
+            }
+        }
+        if cli.session_cache_gb <= 0.0 {
+            tracing::warn!("session cache: --session-cache-gb 0 makes every lineage uncacheable (cold prefills only)");
+        }
     }
     let tok = Arc::new(match (&cli.tokenizer, &cli.model) {
         (Some(t), _) => Tokenizer::from_file(t).map_err(|e| anyhow!("{}: {e}", t.display()))?,
@@ -145,6 +195,7 @@ fn real(cli: &Cli) -> Result<EngineHandle> {
     let args = dsx::server::real::RealEngineArgs {
         model: cli.model.clone().ok_or_else(|| anyhow!("--model is required (or --mock)"))?,
         engram: cli.engram.clone(),
+        overlay: cli.overlay.clone(),
         ctx: cli.ctx,
         chunk: cli.chunk,
         gpu0_gb: cli.gpu0_gb,
@@ -152,6 +203,9 @@ fn real(cli: &Cli) -> Result<EngineHandle> {
         arena_gb: cli.arena_gb,
         rank: cli.rank.clone(),
         vision: cli.vision.clone(),
+        cache_sessions: cli.cache_sessions,
+        session_cache_gb: cli.session_cache_gb,
+        prefix_anchor_tokens: cli.prefix_anchor_tokens,
     };
     EngineHandle::spawn(move || dsx::server::real::real_engine(&args))
 }

@@ -91,9 +91,11 @@ impl Out {
     }
 }
 
+/// the AUX CPUs this machine has; on smaller machines (CI runners have 4 CPUs) the last two CPUs instead
 fn cpus() -> Vec<usize> {
     let n = std::thread::available_parallelism().map_or(4, |n| n.get());
-    dsx::cpu::pool::AUX_CPUS.iter().copied().filter(|&c| c < n).collect()
+    let aux: Vec<usize> = dsx::cpu::pool::AUX_CPUS.iter().copied().filter(|&c| c < n).collect();
+    if aux.is_empty() { (n.saturating_sub(2)..n).collect() } else { aux }
 }
 
 #[test]

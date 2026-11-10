@@ -120,6 +120,14 @@ impl Gpu {
         Ok(n)
     }
 
+    /// the device is pre-SM80 (SM 7.x: Volta has no cp.async; SM75 is intentionally covered by the same pre-SM80
+    /// guards — a multi-arch fatbin JIT'd onto SM75 must also pick the plain gemv): guarded-off kernels take their
+    /// plain fallback, chosen at run time. arch is major*10+minor (70, 86, 120 — not the __CUDA_ARCH__ scale of
+    /// 700/800); pre-SM80 = arch < 80.
+    pub fn is_pre_sm80(&self) -> bool {
+        self.arch < 80
+    }
+
     /// host -> device bandwidth from pinned memory in GB/s (best of 3 copies of `stage`), which tells the link
     /// width apart (x16 vs x4)
     pub fn h2d_gbs(&self, stage: &HostBuf) -> Result<f64> {
@@ -298,6 +306,24 @@ impl Gpu {
     pub fn dtod(&self, dst: u64, src: u64, bytes: usize) -> Result<()> {
         self.bind();
         unsafe { check(cu::cuMemcpyDtoDAsync_v2(dst, src, bytes, self.stream), "cuMemcpyDtoDAsync") }
+    }
+
+    /// Record a device -> host copy on the stream (host destination may be CUDA-registered or pageable).
+    pub fn dtoh_ptr(&self, dst: *mut u8, src: u64, bytes: usize) -> Result<()> {
+        self.bind();
+        unsafe {
+            check(cu::cuMemcpyDtoHAsync_v2(dst as *mut c_void, src, bytes, self.stream), "cuMemcpyDtoHAsync")?;
+            Ok(())
+        }
+    }
+
+    /// Record a host -> device copy on the stream (host source should be page-locked for real asynchrony).
+    pub fn htod_ptr(&self, dst: u64, src: *const u8, bytes: usize) -> Result<()> {
+        self.bind();
+        unsafe {
+            check(cu::cuMemcpyHtoDAsync_v2(dst, src as *const c_void, bytes, self.stream), "cuMemcpyHtoDAsync")?;
+            Ok(())
+        }
     }
 
     pub fn kernel(&self, name: &str) -> Result<Kernel> {
@@ -613,7 +639,6 @@ impl Drop for HostBuf {
 
 unsafe extern "C" {
     fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
-    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
 }
 
 /// /proc/pressure/memory's "some avg10" (percent of the last 10 s with a task stalled on memory)
@@ -652,18 +677,6 @@ unsafe fn fault_in_paced(ptr: *mut u8, size: usize, align: usize) {
     }
     if size > 1 << 30 && waited > 0.0 {
         eprintln!("host buffer: {:.1} GB faulted in, {waited:.1} s waiting on memory pressure", size as f64 / 1e9);
-    }
-}
-
-/// Drop `paths`' pages from the page cache (POSIX_FADV_DONTNEED), e.g. the model files after the GPUs' experts were
-/// read through the mmap, so a large hugepage allocation finds free memory instead of reclaiming and compacting
-/// (memory pressure from that got the server killed by systemd-oomd).
-pub fn drop_page_cache(paths: &[std::path::PathBuf]) {
-    use std::os::fd::AsRawFd;
-    for p in paths {
-        if let Ok(f) = std::fs::File::open(p) {
-            unsafe { posix_fadvise(f.as_raw_fd(), 0, 0, 4) };
-        }
     }
 }
 

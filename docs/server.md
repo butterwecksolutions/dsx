@@ -10,8 +10,10 @@ fixture engine without model weights; supply `--tokenizer` for that mode.
 | `--model` | the model GGUF; for a model in shards, the first one (the others load from beside it) |
 | `--engram` | directory with the official checkpoint's Engram shards (`model-00047/00048-of-00048.safetensors`), or a GGUF holding the table; default: the table in the model GGUF |
 | `--tokenizer` | the official `tokenizer.json`; default: the one stored in the model GGUF |
+| `--overlay` | a GGUF of replacement tensors laid over the model's, such as an [uncensored overlay](overlays.md) (env `DSX_OVERLAY`) |
 | `--rank` | expert hotness order (`expert-rank.json` in the quant repo) |
 | `--vision` / `--no-vision` | image input (default: `vision.safetensors` beside the model); `--no-vision` for text only |
+| `--vision-max-tokens` | most tokens one image may cost (default 1024, DeepSeek's `vision_max_n_token`); larger images are scaled down to fit. Higher keeps more detail but goes past what the model was tuned on (env `DSX_VISION_MAX_TOKENS`) |
 
 **Server**
 
@@ -36,7 +38,13 @@ fixture engine without model weights; supply `--tokenizer` for that mode.
 |---|---|
 | `--arena-gb` | RAM for experts the CPU computes (default 0; ~110 on 128 GB) |
 | `--chunk` | prefill tokens per pass (default 4096); smaller leaves more VRAM for experts |
+| `--cache-sessions N` | conversation lineages kept for prefix reuse, including the active one (default 1). `1` is the existing single-lineage fast path with no host parking; `>1` parks inactive lineages in the host cache so `A -> B -> A` resumes instead of prefilling from token 0 |
+| `--session-cache-gb X` | hard budget for the host cache of inactive lineages, decimal GB (default 8). Admission bounds committed arena bytes and the logical host payload (arena extents, saved logits, Engram histories); exceeding it degrades the hit rate, never correctness. Ignored by `--cache-sessions 1` |
+| `--prefix-anchor-tokens N` | sparse prefix-anchor interval in prompt tokens for multi-session mode (default 16384; `0` disables anchors). A second agent sharing a long system/tools prefix replays only the divergent tail from an earlier anchor |
 | `DSX_GPUS=0,2` | use only these GPUs (all by default) |
+
+Multi-session cache architecture and state audit: [session-cache.md](session-cache.md). Runtime validation was
+performed locally; benchmark numbers are not part of this change.
 
 **Speed**
 

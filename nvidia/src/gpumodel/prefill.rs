@@ -664,6 +664,57 @@ impl GpuModel<'_> {
             pre[t * 24] = 1.0;
         }
         g.htod_sync(pb.mix_f.ptr, &pre)?;
+        // Engram rows depend only on the tokens: gather every Engram layer's rows for the chunk on a helper thread
+        // now (layer 1's first), while the GPUs run the layers before them (DSX_ENGRAM_PREFETCH=0: inline, per layer)
+        let prefetch = m.engram.is_some() && !c.engram_layers.is_empty() && std::env::var("DSX_ENGRAM_PREFETCH").map_or(true, |v| v != "0");
+        let hist = if prefetch { self.engram_hist.clone() } else { vec![] };
+        std::thread::scope(|sc| -> Result<()> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            if prefetch {
+                let hist = &hist;
+                sc.spawn(move || {
+                    for eidx in 0..c.engram_layers.len() {
+                        if tx.send(engram_gather(m, hist, tn, eidx)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            self.prefill_layers(pb, tn, p0, last, all_logits, prefetch.then_some(&rx))
+        })?;
+        let _ = nh;
+        self.pos += tn;
+        if !last {
+            self.g.sync()?;
+            return Ok(None);
+        }
+        let _ = all_logits;
+        // logits of the final token (or of every token for a verify pass)
+        let rows: Vec<usize> = if all_logits { (0..tn).collect() } else { vec![tn - 1] };
+        for &t in &rows {
+            let off = |base: u64, width: usize| base + (t * width * 4) as u64;
+            self.g.launch(self.k["hc_pre"], (1, 1, 1), 256, 0, &[Arg::P(off(pb.h.ptr, hc * d)), Arg::P(off(pb.mix_f.ptr, 24)), Arg::I(0), Arg::P(off(pb.x.ptr, d)), Arg::I(d as i32)])?;
+            self.rms_rows(off(pb.x.ptr, d), &self.out_norm, off(pb.x.ptr, d), d, 1, false)?;
+        }
+        if rows.len() > 1 && rows.len() <= crate::handoff::MAXT {
+            // every row of a verify pass (rows 0..tn, contiguous): one pass over the head
+            self.gemv_t(&self.head, pb.x.ptr, pb.logits.ptr, rows.len())?;
+            let all: Vec<f32> = self.g.download(pb.logits.ptr, rows.len() * c.vocab)?;
+            return Ok(Some(all.chunks(c.vocab).map(|r| r.to_vec()).collect()));
+        }
+        let mut out = vec![];
+        for t in rows {
+            self.gemv(&self.head, pb.x.ptr + (t * d * 4) as u64, pb.logits.ptr)?;
+            out.push(self.g.download(pb.logits.ptr, c.vocab)?);
+        }
+        Ok(Some(out))
+    }
+
+    /// The layers of one prefill chunk; `rx` delivers the prefetched Engram rows (`engram_gather`) in layer order.
+    fn prefill_layers(&mut self, pb: &PrefillBufs, tn: usize, p0: usize, last: bool, all_logits: bool, rx: Option<&std::sync::mpsc::Receiver<Result<EngramRows>>>) -> Result<()> {
+        let m = self.m;
+        let c = &m.cfg;
+        let (d, hc, w) = (c.dim, c.hc, c.window);
         // decoder layer L recomputes the last (n_layers - L) * W tokens: exactly the cone the final token and the
         // decode windows depend on (each layer's window reaches one window further back than the next layer's)
         for li in 0..c.n_layers {
@@ -687,7 +738,7 @@ impl GpuModel<'_> {
                         Ok((lo, hi, b))
                     })
                     .collect::<Result<_>>()?;
-                self.prefill_engram(pb, li, eidx, tn, p0)?;
+                self.prefill_engram(pb, li, eidx, tn, p0, rx)?;
                 for (lo, hi, b) in &saved {
                     self.g.dtod(pb.h.ptr + (lo * row) as u64, b.ptr, (hi - lo) * row)?;
                 }
@@ -725,83 +776,26 @@ impl GpuModel<'_> {
             }
             self.g.launch(self.k["hc_post"], (n as u32, 1, 1), 256, 0, &[Arg::P(hrow(pb.h.ptr, hc * d)), Arg::P(hrow(pb.a.ptr, d)), Arg::P(hrow(pb.mix_f.ptr, 24)), Arg::I(d as i32)])?;
         }
-        let _ = nh;
-        self.pos += tn;
-        if !last {
-            self.g.sync()?;
-            return Ok(None);
-        }
-        let _ = all_logits;
-        // logits of the final token (or of every token for a verify pass)
-        let rows: Vec<usize> = if all_logits { (0..tn).collect() } else { vec![tn - 1] };
-        for &t in &rows {
-            let off = |base: u64, width: usize| base + (t * width * 4) as u64;
-            self.g.launch(self.k["hc_pre"], (1, 1, 1), 256, 0, &[Arg::P(off(pb.h.ptr, hc * d)), Arg::P(off(pb.mix_f.ptr, 24)), Arg::I(0), Arg::P(off(pb.x.ptr, d)), Arg::I(d as i32)])?;
-            self.rms_rows(off(pb.x.ptr, d), &self.out_norm, off(pb.x.ptr, d), d, 1, false)?;
-        }
-        if rows.len() > 1 && rows.len() <= crate::handoff::MAXT {
-            // every row of a verify pass (rows 0..tn, contiguous): one pass over the head
-            self.gemv_t(&self.head, pb.x.ptr, pb.logits.ptr, rows.len())?;
-            let all: Vec<f32> = self.g.download(pb.logits.ptr, rows.len() * c.vocab)?;
-            return Ok(Some(all.chunks(c.vocab).map(|r| r.to_vec()).collect()));
-        }
-        let mut out = vec![];
-        for t in rows {
-            self.gemv(&self.head, pb.x.ptr + (t * d * 4) as u64, pb.logits.ptr)?;
-            out.push(self.g.download(pb.logits.ptr, c.vocab)?);
-        }
-        Ok(Some(out))
+        Ok(())
     }
 
-    fn prefill_engram(&mut self, pb: &PrefillBufs, li: usize, eidx: usize, tn: usize, p0: usize) -> Result<()> {
-        let m = self.m;
-        let c = &m.cfg;
-        let tabs = m.engram.as_ref().ok_or_else(|| anyhow::anyhow!("engram tables not loaded"))?;
-        let tab = tabs.layer(eidx, c.engram_dim)?;
-        let tab = &tab;
-        let hd = c.engram_dim;
-        let hist_len = self.engram_hist.len();
-        let base = hist_len - tn; // history index of the chunk's first token
-        let per = (c.engram_ngram - 1) * c.engram_heads;
-        // hashes per token, then rows gathered in parallel (page faults overlap across threads)
-        let t_h = std::time::Instant::now();
-        let ids: Vec<u64> = (0..tn).flat_map(|t| m.engram_hashes_for(&self.engram_hist[..base + t + 1], eidx)).collect();
-        let t_hash = t_h.elapsed().as_secs_f64();
-        // distinct rows only (n-grams repeat), gathered by 32 plain threads (deep NVMe queue; rayon's pool shares
-        // cores with the spinning CPU-expert workers), then expanded back to per-token order
-        let mut uniq: Vec<u64> = ids.clone();
-        uniq.sort_unstable();
-        uniq.dedup();
-        let mut ubuf = vec![0f32; uniq.len() * hd];
-        let nthreads = 32;
-        let per_thread = uniq.len().div_ceil(nthreads).max(1);
-        std::thread::scope(|sc| {
-            for (chunk, idc) in ubuf.chunks_mut(per_thread * hd).zip(uniq.chunks(per_thread)) {
-                sc.spawn(move || {
-                    crate::cpu::pool::pin_to_set(&crate::cpu::pool::ALL_CPUS);
-                    for (o, &row) in chunk.chunks_mut(hd).zip(idc) {
-                        tab.row(row as usize, o);
-                    }
-                });
-            }
-        });
-        let mut ebuf = vec![0f32; tn * per * hd];
-        for (o, id) in ebuf.chunks_mut(hd).zip(&ids) {
-            let u = uniq.binary_search(id).unwrap();
-            o.copy_from_slice(&ubuf[u * hd..(u + 1) * hd]);
-        }
+    fn prefill_engram(&mut self, pb: &PrefillBufs, li: usize, eidx: usize, tn: usize, p0: usize, rx: Option<&std::sync::mpsc::Receiver<Result<EngramRows>>>) -> Result<()> {
+        let c = &self.m.cfg;
+        let t_w = std::time::Instant::now();
+        let r = match rx {
+            Some(rx) => rx.recv().map_err(|_| anyhow::anyhow!("engram prefetch thread ended early"))??,
+            None => engram_gather(self.m, &self.engram_hist, tn, eidx)?,
+        };
+        anyhow::ensure!(r.eidx == eidx, "engram rows for layer index {} arrived for {eidx}", r.eidx);
+        let ebuf = r.rows;
         if std::env::var_os("DSX_PROF").is_some() {
-            eprintln!("engram L{li}: {} rows, {} distinct", ids.len(), uniq.len());
+            eprintln!("engram L{li}: {} rows, {} distinct, hash {:.0} ms, gather {:.0} ms, waited {:.0} ms", r.n, r.distinct, r.hash_s * 1e3, r.gather_s * 1e3, t_w.elapsed().as_secs_f64() * 1e3);
         }
         let _ = p0;
-        let t_gather = t_h.elapsed().as_secs_f64() - t_hash;
         // Tiny GEMVs read their f32 source directly; unlike GEMM they do not pack it
         // before writing the destination. Keep Engram input separate from shared Q/tmp.
         let input = if pb.tmp.is_none() && tn <= crate::handoff::MAXT { pb.w16.ptr } else { pb.attn_out() };
         self.g.htod_sync(input, &ebuf)?;
-        if std::env::var_os("DSX_PROF").is_some() {
-            eprintln!("engram L{li}: hash {:.0} ms, gather {:.0} ms, upload {:.0} ms", t_hash * 1e3, t_gather * 1e3, (t_h.elapsed().as_secs_f64() - t_hash - t_gather) * 1e3);
-        }
         let l = &self.layers[li];
         let kvw = l.engram_kv.as_ref().unwrap();
         self.gemm(pb, kvw, input, pb.tmp_ptr(), tn)?;
@@ -1331,4 +1325,52 @@ impl GpuModel<'_> {
         self.g.dtod(a, pb.out.ptr, n * d * 4)?;
         self.g.launch(self.k["round_bf16"], (((n * d) as u32).div_ceil(256), 1, 1), 256, 0, &[Arg::P(a), Arg::I((n * d) as i32)])
     }
+}
+
+/// One Engram layer's rows for the last `tn` tokens of `hist`, in per-token order ([tn][(ngram-1)*heads][dim]).
+pub(crate) struct EngramRows {
+    eidx: usize,
+    rows: Vec<f32>,
+    n: usize,
+    distinct: usize,
+    hash_s: f64,
+    gather_s: f64,
+}
+
+/// Hash the chunk's n-grams, read the distinct rows on 32 plain threads (deep NVMe queue; rayon's pool shares cores
+/// with the spinning CPU-expert workers), then expand them back to per-token order.
+pub(crate) fn engram_gather(m: &Model, hist: &[i64], tn: usize, eidx: usize) -> Result<EngramRows> {
+    let c = &m.cfg;
+    let tabs = m.engram.as_ref().ok_or_else(|| anyhow::anyhow!("engram tables not loaded"))?;
+    let tab = tabs.layer(eidx, c.engram_dim)?;
+    let tab = &tab;
+    let hd = c.engram_dim;
+    let base = hist.len() - tn; // history index of the chunk's first token
+    let per = (c.engram_ngram - 1) * c.engram_heads;
+    let t_h = std::time::Instant::now();
+    let ids: Vec<u64> = (0..tn).flat_map(|t| m.engram_hashes_for(&hist[..base + t + 1], eidx)).collect();
+    let hash_s = t_h.elapsed().as_secs_f64();
+    let mut uniq: Vec<u64> = ids.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    let mut ubuf = vec![0f32; uniq.len() * hd];
+    let nthreads = 32;
+    let per_thread = uniq.len().div_ceil(nthreads).max(1);
+    std::thread::scope(|sc| {
+        for (chunk, idc) in ubuf.chunks_mut(per_thread * hd).zip(uniq.chunks(per_thread)) {
+            sc.spawn(move || {
+                crate::cpu::pool::pin_to_set(&crate::cpu::pool::ALL_CPUS);
+                for (o, &row) in chunk.chunks_mut(hd).zip(idc) {
+                    tab.row(row as usize, o);
+                }
+            });
+        }
+    });
+    let mut rows = vec![0f32; tn * per * hd];
+    for (o, id) in rows.chunks_mut(hd).zip(&ids) {
+        let u = uniq.binary_search(id).unwrap();
+        o.copy_from_slice(&ubuf[u * hd..(u + 1) * hd]);
+    }
+    let gather_s = t_h.elapsed().as_secs_f64() - hash_s;
+    Ok(EngramRows { eidx, rows, n: ids.len(), distinct: uniq.len(), hash_s, gather_s })
 }

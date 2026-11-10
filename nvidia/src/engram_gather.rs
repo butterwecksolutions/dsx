@@ -97,6 +97,9 @@ impl EngramGather {
     /// one worker per CPU in `cpus`, each pinned to it
     pub fn with_source(src: Box<dyn RowSource>, out: &mut [f32], prof: bool, cpus: &[usize]) -> Result<EngramGather> {
         let (layers, per, dim) = src.shape();
+        if cpus.is_empty() {
+            bail!("engram gather: no CPUs to run the gather workers on");
+        }
         if per * layers > MAX_ROWS || out.len() < per * layers * dim {
             bail!("engram gather: {layers} x {per} rows do not fit");
         }

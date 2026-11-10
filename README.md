@@ -32,7 +32,21 @@ hf download lxe/DeepSeek-V4.1-Flash-1017-dsx-t16 --local-dir dsx-t16
 CUDA_ARCHS=86 cargo build --release -p dsx --features cuda
 ```
 
-Use `CUDA_ARCHS=89` for an RTX 4090 or `120` for an RTX 5090. Start the server:
+Use `CUDA_ARCHS=89` for an RTX 4090 or `120` for an RTX 5090. **`CUDA_ARCHS=70` runs on Tesla V100 (Volta) — see [Tesla V100](#tesla-v100-sm70).**
+
+### Tesla V100 (SM70)
+
+`CUDA_ARCHS=70` (with CUDA 12.9) builds for Volta: every SM80-only kernel has an SM70 twin, and SM80+ binaries are
+unchanged. Measured on 2x V100-PCIE-32GB with 108 GB of RAM: 21-23 tokens/s decode and 467 tokens/s prefill on a
+123K-token prompt. Details and checks: [bench/results/2026-11-01-volta](bench/results/2026-11-01-volta/README.md).
+
+```bash
+CUDA_ARCHS=70 cargo build --release -p dsx --features cuda
+DSX_GPUS=0,1 ./target/release/dsx-server --model dsx-t16/DeepSeek-V4.1-Flash-1017-dsx-t16.gguf \
+  --rank dsx-t16/expert-rank.json --main-gb=-2.0 --arena-gb 85 --ctx 131072
+```
+
+Start the server:
 
 ```bash
 ./target/release/dsx-server \
@@ -50,6 +64,20 @@ Use `--no-vision` for text only.
 `--defer-rank 3` lets lower-ranked CPU experts finish one layer late to reduce GPU waiting. It changes the model’s
 computation; omit the flag to disable that approximation. See [server configuration](docs/server.md) for all options
 and [expert placement](docs/placement.md) for other memory and GPU configurations.
+
+Or build and run the same server in Docker (NVIDIA Container Toolkit required). The default image carries sm_86,
+sm_89 and sm_120 kernels; `--build-arg CUDA_ARCHS=86` narrows the fatbin to one GPU:
+
+```bash
+docker build -t dsx .
+docker run --gpus all --ipc=host --ulimit memlock=-1:-1 \
+  -v "$PWD/dsx-t16:/models:ro" -p 8090:8090 dsx \
+  --model /models/DeepSeek-V4.1-Flash-1017-dsx-t16.gguf \
+  --rank /models/expert-rank.json --ctx 131072 --arena-gb 110 \
+  --host 0.0.0.0 --port 8090
+```
+
+`--target amd` builds the MI325X runner instead.
 
 ## Coding agents and API
 
@@ -111,6 +139,7 @@ needs prefill. [DESIGN.md](DESIGN.md) describes the execution and memory layout.
 | [Coding agents](docs/agents.md) | Pi provider configuration |
 | [Expert placement](docs/placement.md) | GPU, RAM and disk placement; tuning for your machine |
 | [T16 format](docs/t16-format.md) | Quantization and CPU/GPU decoding |
+| [Overlays](docs/overlays.md) | Small GGUFs that replace a few tensors at load, such as the uncensored overlay |
 | [NVIDIA runner](nvidia/README.md) | CLI tools, build details and debugging |
 | [AMD runner](amd/README.md) | The separate MI325X implementation and model |
 | [Measurements](docs/current-state.md) | Current runtime status, quality evidence and benchmark history |
