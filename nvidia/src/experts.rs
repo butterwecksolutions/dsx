@@ -707,8 +707,9 @@ impl GpuExperts {
 /// given, else layer-major round robin from expert 0). Stores with a lower `group` fill first (static stores before
 /// adaptive ones, which reshuffle at run time anyway); within a group each expert goes to the least-filled store
 /// that has room, so the hot experts, and the decode work, spread evenly over GPUs that run in parallel.
-/// `cost`: each store's measured cost per expert pick relative to the fastest (tier.rs); when given, every store is in
-/// one group and a store counts as `cost` times as full, so the hottest experts go preferably to the faster GPUs.
+/// `cost`: each store's measured cost per expert pick relative to the fastest (tier.rs); when given, a store counts as
+/// `cost` times as full within its group, so among GPUs of a group the hottest experts go preferably to the faster ones.
+/// Groups keep their order (static stores before adaptive ones).
 pub fn place(m: &Model, rank: Option<&[(usize, usize)]>, caps: &[usize], group: &[u8], cost: Option<&[f64]>) -> Vec<Vec<(usize, usize)>> {
     let c = &m.cfg;
     let order: Vec<(usize, usize)> = match rank {
@@ -731,12 +732,11 @@ pub fn place(m: &Model, rank: Option<&[(usize, usize)]>, caps: &[usize], group: 
 /// place's fill rule on sizes: the store each item goes to (None = no room anywhere)
 fn assign(sizes: impl Iterator<Item = usize>, caps: &[usize], group: &[u8], cost: Option<&[f64]>) -> Vec<Option<usize>> {
     let mut used = vec![0usize; caps.len()];
-    let grp = |i: usize| if cost.is_some() { 0 } else { group[i] };
     let w = |i: usize| cost.and_then(|c| c.get(i).copied()).unwrap_or(1.0);
     sizes
         .map(|s| {
             let fill = |i: usize| used[i] as f64 / caps[i] as f64 * w(i);
-            let pick = (0..caps.len()).filter(|&i| used[i] + s <= caps[i]).min_by(|&i, &j| grp(i).cmp(&grp(j)).then(fill(i).total_cmp(&fill(j))));
+            let pick = (0..caps.len()).filter(|&i| used[i] + s <= caps[i]).min_by(|&i, &j| group[i].cmp(&group[j]).then(fill(i).total_cmp(&fill(j))));
             if let Some(i) = pick {
                 used[i] += s;
             }
@@ -756,11 +756,11 @@ mod place_tests {
 
     #[test]
     fn measured_cost_sends_the_hottest_to_the_faster_store() {
-        // equal stores of 6; the second costs 2x per pick: of the first 6 experts (hottest), 4 go to the first
-        let o = super::assign([1usize; 6].into_iter(), &[6, 6], &[1, 0], Some(&[1.0, 2.0]));
+        // two static stores of 6; the second costs 2x per pick: of the first 6 experts (hottest), 4 go to the first
+        let o = super::assign([1usize; 6].into_iter(), &[6, 6], &[0, 0], Some(&[1.0, 2.0]));
         assert_eq!(o.iter().filter(|x| **x == Some(0)).count(), 4);
-        // without measurements the groups decide as before
-        let o = super::assign([1usize; 2].into_iter(), &[6, 6], &[1, 0], None);
+        // costs never override the group order: the static store still fills first
+        let o = super::assign([1usize; 2].into_iter(), &[6, 6], &[1, 0], Some(&[1.0, 5.0]));
         assert_eq!(o, vec![Some(1), Some(1)]);
     }
 

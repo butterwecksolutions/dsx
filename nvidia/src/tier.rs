@@ -52,8 +52,14 @@ const MOVE_MIN_SCORE: f64 = 8.0;
 const MOVE_RATIO: f64 = 0.5;
 pub const PREFETCH_SLOTS: usize = 4;
 pub const MAX_STORES: usize = 9;
-/// one expert-time sample per this many decode tokens
+/// one sample (expert kernels and the main GPU's waits, one layer, rotating) per this many decode tokens
 pub const SAMPLE_EVERY: u64 = 64;
+/// a measured wait counts as real above this (µs per layer); below it the device was not on the critical path
+const WAIT_US: f64 = 20.0;
+/// smoothing of the measured waits (weight of a new sample)
+const WAIT_EMA: f64 = 0.05;
+/// samples before the waits steer moves
+const WAIT_MIN_SAMPLES: u64 = 16;
 const DEVICE_KEEP_SECS: u64 = 90 * 86400;
 const MAX_CONFIGS: usize = 16;
 const STATE_VERSION: u64 = 2;
@@ -93,6 +99,8 @@ pub struct Tier {
     store_picks: [AtomicU64; MAX_STORES],
     /// per store: sampled expert-kernel ms of one layer, and the number of samples
     gpu_ms: Mutex<Vec<(f64, u64)>>,
+    /// the main GPU's waits per layer after its own work (smoothed, µs): for the CPU's experts, then for the aux GPUs'
+    waits: Mutex<Waits>,
     last_decode: AtomicU64,
     /// decode passes: all of them, and those right after another (timed: `busy_us`)
     all_passes: AtomicU64,
@@ -106,6 +114,8 @@ pub struct Tier {
     prefetch: OnceLock<Prefetch>,
     ssd: OnceLock<SsdBuffer>,
     stop: AtomicBool,
+    /// taken by the first model that sets tiering up in this process
+    claimed: AtomicBool,
     t0: std::time::Instant,
 }
 
@@ -139,6 +149,7 @@ impl Tier {
             hits: Default::default(),
             store_picks: Default::default(),
             gpu_ms: Mutex::new(vec![(0.0, 0); MAX_STORES]),
+            waits: Mutex::new(Waits::default()),
             last_decode: AtomicU64::new(0),
             all_passes: AtomicU64::new(0),
             passes: AtomicU64::new(0),
@@ -150,6 +161,7 @@ impl Tier {
             prefetch: OnceLock::new(),
             ssd: OnceLock::new(),
             stop: AtomicBool::new(false),
+            claimed: AtomicBool::new(false),
             t0: std::time::Instant::now(),
         }
     }
@@ -157,6 +169,11 @@ impl Tier {
     /// Register as the process-wide instance (first call wins).
     pub fn init(nl: usize, ne: usize) -> &'static Tier {
         GLOBAL.get_or_init(|| Box::leak(Box::new(Tier::new(nl, ne))))
+    }
+
+    /// True for the first caller only: tiering state belongs to one model per process.
+    pub fn claim(&self, nl: usize, ne: usize) -> bool {
+        self.nl == nl && self.ne == ne && !self.claimed.swap(true, Ordering::AcqRel)
     }
 
     /// A decode pass's picks for one layer (all experts, GPU-resident ones included).
@@ -205,6 +222,17 @@ impl Tier {
             g[store].0 += ms;
             g[store].1 += 1;
         }
+    }
+
+    /// One sampled layer: how long the main GPU waited for the CPU's experts, then for the aux GPUs' (ms).
+    pub fn note_waits(&self, cpu_ms: f64, aux_ms: f64) {
+        if cpu_ms.is_finite() && aux_ms.is_finite() && cpu_ms >= 0.0 && aux_ms >= 0.0 {
+            self.waits.lock().unwrap().add(cpu_ms * 1000.0, aux_ms * 1000.0);
+        }
+    }
+
+    pub fn waits(&self) -> Waits {
+        *self.waits.lock().unwrap()
     }
 
     pub fn idle_for(&self) -> u64 {
@@ -349,8 +377,9 @@ impl Prefetch {
 
 /// Plan up to `room` moves: hottest experts on no GPU against the coldest same-key residents of stores that take
 /// run-time moves, a victim at most `MOVE_RATIO` of the candidate's score. Per expert (`layer * ne + expert`):
-/// `score`, `loc`, `key`; moves in `busy` (planned or in transit) block both of their experts.
-pub fn plan_moves(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[StoreInfo], busy: &[Move], room: usize) -> Vec<Move> {
+/// `score`, `loc`, `key`; `open` per store (see `Waits::open`); moves in `busy` (planned or in transit) block both of
+/// their experts.
+pub fn plan_moves(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[StoreInfo], open: &[bool], busy: &[Move], room: usize) -> Vec<Move> {
     let ne = ne.max(1);
     let mut off: std::collections::HashSet<usize> = busy.iter().flat_map(|m| [m.new, m.victim]).map(|(l, e)| l * ne + e).collect();
     let mut victims: HashMap<(usize, u32), Vec<(f64, usize)>> = HashMap::new();
@@ -360,7 +389,7 @@ pub fn plan_moves(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[S
             continue;
         }
         let st = (s - LOC_GPU) as usize;
-        if !stores.get(st).is_some_and(|x| x.tier_swaps) {
+        if !stores.get(st).is_some_and(|x| x.tier_swaps) || !open.get(st).copied().unwrap_or(true) {
             continue;
         }
         victims.entry((st, key[i])).or_default().push((score[i], i));
@@ -399,6 +428,40 @@ pub fn plan_moves(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[S
         out.push(Move { new: (i / ne, i % ne), store: st, victim: (vi / ne, vi % ne) });
     }
     out
+}
+
+/// Where a layer's time goes once the main GPU has done its own part: waiting for the CPU's experts, then for the
+/// aux GPUs'. A device that makes the main GPU wait is on the critical path; one that does not has room.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Waits {
+    pub cpu_us: f64,
+    pub aux_us: f64,
+    pub samples: u64,
+}
+
+impl Waits {
+    fn add(&mut self, cpu_us: f64, aux_us: f64) {
+        if self.samples == 0 {
+            (self.cpu_us, self.aux_us) = (cpu_us, aux_us);
+        } else {
+            self.cpu_us += (cpu_us - self.cpu_us) * WAIT_EMA;
+            self.aux_us += (aux_us - self.aux_us) * WAIT_EMA;
+        }
+        self.samples += 1;
+    }
+
+    /// Which stores may take more experts from the CPU (store 0 = main GPU, then the aux GPUs). Moving a hot expert from
+    /// the CPU onto a GPU only shortens a layer while the CPU is what the main GPU waits for, and only onto a GPU that is
+    /// not itself the last to finish: the main GPU while the CPU makes it wait, an aux GPU while it finishes before the
+    /// CPU. Before enough samples every store is open.
+    pub fn open(&self, stores: usize) -> Vec<bool> {
+        if self.samples < WAIT_MIN_SAMPLES {
+            return vec![true; stores];
+        }
+        let cpu_slow = self.cpu_us > WAIT_US;
+        let aux_free = self.aux_us <= WAIT_US;
+        (0..stores).map(|i| cpu_slow && (i == 0 || aux_free)).collect()
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ learned state
@@ -581,7 +644,8 @@ pub fn save(path: &Path, id: &str, files: &[String], nl: usize, ne: usize, s: &S
         "usage": {"tokens": s.learned.tokens, "score": s.learned.score.iter().map(|x| (x * 1000.0).round() / 1000.0).collect::<Vec<_>>()},
         "devices": s.devices, "configs": s.configs, "stats": stats, "saved": now_secs(),
     });
-    let tmp = path.with_extension("json.tmp");
+    // per-process temp name: two servers on the same model never write into one temp file
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     {
         let mut f = File::create(&tmp)?;
         f.write_all(serde_json::to_string(&v)?.as_bytes())?;
@@ -987,6 +1051,15 @@ impl Background {
                 c.insert("decode_tok_s".into(), ((passes as f64 / busy * 100.0).round() / 100.0).into());
             }
             c.insert("share_from_file".into(), (((h[3] as f64 / tot) * 1000.0).round() / 1000.0).into());
+            let w = self.tier.waits();
+            if w.samples >= WAIT_MIN_SAMPLES {
+                c.insert("wait_for_cpu_us".into(), w.cpu_us.round().into());
+                c.insert("wait_for_aux_us".into(), w.aux_us.round().into());
+            }
+            let cpu = h[1] + h[2] + h[3];
+            if all > 0 {
+                c.insert("cpu_picks_per_token".into(), ((cpu as f64 / all as f64 * 100.0).round() / 100.0).into());
+            }
             c.insert("seen".into(), now.into());
             self.saved.configs.insert(key, serde_json::Value::Object(c));
         }
@@ -1005,6 +1078,9 @@ impl Background {
             "experts_on_gpus": on_gpu,
             "file_side_experts": (0..self.tier.nl * ne).filter(|&i| self.tier.loc(i) == LOC_FILE).count(),
             "moves_planned": st.moves_planned,
+            "wait_for_cpu_us": self.tier.waits().cpu_us.round(),
+            "wait_for_aux_us": self.tier.waits().aux_us.round(),
+            "wait_samples": self.tier.waits().samples,
             "page_cache_warm_gb": (st.warm_bytes as f64 / 1e9 * 10.0).round() / 10.0,
             "model_read_mb_s": self.model_read_mb_s.map(f64::round).or(rate(st.warm_bytes, st.warm_secs)),
             "ssd_buffer": self.tier.ssd.get().map(|s| serde_json::json!({"path": s.path(), "used_gb": (s.used() as f64 / 1e9 * 10.0).round() / 10.0,
@@ -1028,7 +1104,8 @@ impl Background {
         let ne = self.tier.ne;
         let loc: Vec<u8> = (0..self.tier.nl * ne).map(|i| self.tier.loc(i)).collect();
         let busy = pf.in_transit();
-        let moves = plan_moves(ne, &self.saved.learned.score, &loc, key, stores, &busy, free);
+        let open = self.tier.waits().open(stores.len());
+        let moves = plan_moves(ne, &self.saved.learned.score, &loc, key, stores, &open, &busy, free);
         let mut n = 0;
         for mv in moves {
             let Some(i) = pf.claim() else { break };
@@ -1279,6 +1356,14 @@ mod tests {
     }
 
     #[test]
+    fn only_the_first_model_of_its_shape_claims_tiering() {
+        let t = Tier::new(2, 8);
+        assert!(!t.claim(3, 8), "other shape");
+        assert!(t.claim(2, 8));
+        assert!(!t.claim(2, 8), "second model");
+    }
+
+    #[test]
     fn picks_hits_and_store_counts() {
         let t = Tier::new(2, 8);
         t.note_picks(1, &[7, 3, 3]);
@@ -1307,13 +1392,39 @@ mod tests {
         let loc = [LOC_GPU, LOC_GPU, LOC_GPU + 1, LOC_FILE, LOC_ARENA, LOC_FILE, LOC_FILE, LOC_GPU];
         let key = [1, 1, 1, 1, 1, 2, 1, 1];
         let score = [5.0, 100.0, 1.0, 50.0, 30.0, 999.0, 3.0, 20.0];
-        let m = plan_moves(8, &score, &loc, &key, &stores, &[], 4);
+        let m = plan_moves(8, &score, &loc, &key, &stores, &[true, true], &[], 4);
         // 50 replaces the coldest tier store resident (5), 30 the next (20 > 15: no), 999 has no same-key victim,
         // 3 is below the minimum, store 1's resident (1) is not a tiering victim
         assert_eq!(m, vec![Move { new: (0, 3), store: 0, victim: (0, 0) }]);
         // a move in transit blocks both experts
-        let m2 = plan_moves(8, &score, &loc, &key, &stores, &m, 4);
+        let m2 = plan_moves(8, &score, &loc, &key, &stores, &[true, true], &m, 4);
         assert!(m2.iter().all(|x| x.new != (0, 3) && x.victim != (0, 0)));
+        // a store on the critical path takes nothing
+        assert!(plan_moves(8, &score, &loc, &key, &stores, &[false, true], &[], 4).is_empty());
+    }
+
+    #[test]
+    fn waits_decide_which_gpu_may_take_cpu_work() {
+        let mut w = Waits::default();
+        assert_eq!(w.open(2), vec![true, true], "unmeasured: open");
+        for _ in 0..WAIT_MIN_SAMPLES {
+            w.add(300.0, 0.0); // the main GPU waits for the CPU; the aux GPU is done before it
+        }
+        assert_eq!(w.open(2), vec![true, true]);
+        let mut a = w;
+        for _ in 0..200 {
+            a.add(300.0, 150.0); // the aux GPU finishes last: it takes no more
+        }
+        assert_eq!(a.open(2), vec![true, false]);
+        let mut c = w;
+        for _ in 0..200 {
+            c.add(0.0, 0.0); // the CPU is never waited for: no move helps
+        }
+        assert_eq!(c.open(2), vec![false, false]);
+        let t = Tier::new(1, 1);
+        t.note_waits(0.3, 0.0);
+        assert_eq!(t.waits().samples, 1);
+        assert!((t.waits().cpu_us - 300.0).abs() < 1e-9);
     }
 
     #[test]

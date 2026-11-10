@@ -181,6 +181,8 @@ pub struct GpuModel<'m> {
     tier_tokens: u64,
     tier_sample: Option<usize>,
     tev0: Option<[crate::gpu::Event; 2]>,
+    /// the main GPU's waits in the sampled layer: before the CPU's experts, after them, after the aux GPUs'
+    twait: Option<[crate::gpu::Event; 3]>,
     /// one-token Q8_0 GEMVs on gemv_q8r1 (DSX_Q8R1=0: gemv_q8r, for A/Bs)
     q8r1: bool,
     /// one-token split-k GEMVs on the *_sk1 kernels (DSX_SK1=0: the generic ones, for A/Bs)
@@ -502,6 +504,7 @@ impl<'m> GpuModel<'m> {
             tier_tokens: 0,
             tier_sample: None,
             tev0: None,
+            twait: None,
             q8r1: std::env::var("DSX_Q8R1").map_or(true, |v| v != "0"),
             sk1: std::env::var("DSX_SK1").map_or(true, |v| v != "0"),
             combine_fused: std::env::var("DSX_COMBINE_FUSED").map_or(true, |v| v != "0"),
@@ -774,7 +777,9 @@ impl<'m> GpuModel<'m> {
             gm.arena = arena;
             let tier = crate::tier::Tier::init(c.n_layers, c.n_experts);
             gm.worker = Some(crate::handoff::CpuWorker::spawn(ms, xch, on_cpu, c.top_k, arena));
-            if let (Some(path), Some((state, id, name))) = (model_paths.first().cloned(), tier_state.clone()) {
+            // tiering state is per process: only the first model's shape gets it (a second model, e.g. in a bench, runs without)
+            let tier_ok = tier.claim(c.n_layers, c.n_experts);
+            if let (true, Some(path), Some((state, id, name))) = (tier_ok, model_paths.first().cloned(), tier_state.clone()) {
                 let ne = c.n_experts;
                 // where every expert is computed from now: a GPU store, the arena, else the file side
                 for l in 0..c.n_layers {
@@ -825,6 +830,7 @@ impl<'m> GpuModel<'m> {
                 if gm.exp0.is_some() {
                     gm.tev0 = Some([gm.g.timed_event()?, gm.g.timed_event()?]);
                 }
+                gm.twait = Some([gm.g.timed_event()?, gm.g.timed_event()?, gm.g.timed_event()?]);
                 for a in gm.aux.iter_mut() {
                     a.tev = Some([a.g.timed_event()?, a.g.timed_event()?]);
                 }
@@ -998,6 +1004,11 @@ impl<'m> GpuModel<'m> {
         }
         self.gemv_t(&l.sh_down, hm, a, t)?;
         self.ev(li, 4)?;
+        // tiering: in the sampled layer, time the main GPU's waits for the CPU's experts and then the aux GPUs'
+        let waits = if t == 1 && self.tier_sample == Some(li) { self.twait } else { None };
+        if let Some([w0, _, _]) = waits {
+            self.g.record(w0, false)?;
+        }
         // the CPU's experts: this layer's (or, deferred, the previous layer's; the last layer waits for its own too)
         let last = li + 1 == c.n_layers;
         self.flag_wait(d0 + crate::handoff::CPU as u64, seq)?;
@@ -1038,8 +1049,14 @@ impl<'m> GpuModel<'m> {
             }
         }
         self.ev(li, 5)?;
+        if let Some([_, w1, _]) = waits {
+            self.g.record(w1, false)?;
+        }
         for i in 0..self.aux.len() {
             self.flag_wait(d0 + crate::handoff::aux_flag(i) as u64, seq)?;
+        }
+        if let Some([_, _, w2]) = waits {
+            self.g.record(w2, false)?;
         }
         self.ev(li, 6)?;
         if fuse {
@@ -1235,15 +1252,27 @@ impl<'m> GpuModel<'m> {
         Ok(())
     }
 
-    /// After a sampled token's sync: its timed layer's expert-kernel time per store, for tiering's GPU measurements.
+    /// After a sampled token's sync: its timed layer's expert-kernel time per store and the main GPU's waits, for
+    /// tiering's measurements. A failed query only loses the sample: measurement never fails a token.
     fn tier_collect(&mut self) -> Result<()> {
         if self.tier_sample.take().is_none() {
             return Ok(());
         }
+        let _ = self.tier_collect_inner();
+        self.g.bind();
+        Ok(())
+    }
+
+    fn tier_collect_inner(&mut self) -> Result<()> {
         let Some(t) = crate::tier::global() else { return Ok(()) };
         if let Some([a, b]) = self.tev0 {
             if self.g.done(b)? {
                 t.note_gpu_ms(0, self.g.elapsed_ms(a, b)? as f64);
+            }
+        }
+        if let Some([w0, w1, w2]) = self.twait {
+            if self.g.done(w2)? {
+                t.note_waits(self.g.elapsed_ms(w0, w1)? as f64, self.g.elapsed_ms(w1, w2)? as f64);
             }
         }
         for (i, x) in self.aux.iter().enumerate() {
@@ -1951,7 +1980,8 @@ impl<'m> GpuModel<'m> {
         let early = adapt_early();
         // tiering: time one layer's expert kernels every SAMPLE_EVERY tokens
         self.tier_tokens += 1;
-        self.tier_sample = (crate::tier::global().is_some() && self.tier_tokens % crate::tier::SAMPLE_EVERY == 0).then_some(self.m.cfg.n_layers / 2);
+        self.tier_sample = (crate::tier::global().is_some() && self.tier_tokens % crate::tier::SAMPLE_EVERY == 0)
+            .then_some((self.tier_tokens / crate::tier::SAMPLE_EVERY) as usize % self.m.cfg.n_layers);
         let r = self.step_inner(token).and_then(|()| {
             let t = std::time::Instant::now();
             if self.adapt > 0 && early {

@@ -14,14 +14,29 @@ runs, measures the devices it runs on and keeps all of it next to the model for 
 | every decode pass | the CPU worker counts each layer's picks (GPU-resident ones included) and which tier served them: a GPU store, the arena, the SSD buffer or the file |
 | every 10 s | a background thread folds the counts into a long-term score per expert (half-life 200k decode tokens) |
 | while decoding, at most one per token | a hot expert on no GPU replaces a clearly colder resident (at most half its score, same quant types) of a GPU store that otherwise keeps a fixed set |
-| every 64th token | one layer's expert kernels are timed on every GPU (CUDA events): cost per pick per GPU |
+| every 64th token | one layer (rotating) is timed with CUDA events: expert kernels per GPU (cost per pick), and how long the main GPU waits for the CPU and for the aux GPUs |
 | idle (no decode for 30 s) | the page cache is warmed with the hottest experts the CPU reads from the file side, within a RAM budget |
 | idle, model on a slow medium | those experts are copied into an SSD buffer on another, faster device; the CPU reads them from there at once |
 | idle, every 5 min | the state is saved atomically; the previous version stays as `.prev` |
-| next startup | the learned score is blended into the ranking before placement, and with measured GPU costs the hottest experts go preferably to the faster GPU |
+| next startup | the learned score is blended into the ranking before placement, and with measured GPU costs the hottest experts go preferably to the faster GPU among those of the same kind (static stores still fill before adaptive ones) |
 
 Routing is never changed: only where an expert's bytes are and which device computes it. As with any placement, a
 different device can change the floating-point summation order of an expert's output.
+
+### Who is waited for
+
+Every 64th decode token, one layer (rotating through all of them) is timed on the main GPU with CUDA events: after its
+own work it waits for the CPU's experts, then for the aux GPUs'. Smoothed over the samples this says which device is on
+the critical path:
+
+| Main GPU waits for the CPU | … then for the aux GPUs | Meaning | Moves from the CPU go to |
+|---|---|---|---|
+| > 20 µs | ≤ 20 µs | the CPU is the bottleneck, the aux GPUs have room | every GPU store that takes moves |
+| > 20 µs | > 20 µs | the CPU is slow, an aux GPU finishes even later | the main GPU only |
+| ≤ 20 µs | any | the CPU is not what the layer waits for | nowhere: moving work onto a GPU would only lengthen its part |
+
+Until 16 samples are in, every store takes moves. The waits and the CPU's picks per token are kept per GPU combination
+in the state file.
 
 ### Run-time moves
 
@@ -58,7 +73,7 @@ modification time) or of the model's shape starts fresh.
     "disk:8:16": {"read_mb_s": …, "seen": …}
   },
   "configs": {
-    "GPU-3f2a…+GPU-9c11…": {"decode_tok_s": …, "share_from_file": …, "seen": …}
+    "GPU-3f2a…+GPU-9c11…": {"decode_tok_s": …, "share_from_file": …, "cpu_picks_per_token": …, "wait_for_cpu_us": …, "wait_for_aux_us": …, "seen": …}
   },
   "stats": { … }
 }
