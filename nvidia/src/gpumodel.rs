@@ -596,6 +596,16 @@ impl<'m> GpuModel<'m> {
             }
         }
         let mut prior: Vec<(usize, usize, u64)> = vec![];
+        // automatic tiering (tier.rs): the usage this machine learned in earlier runs, if any
+        let model_path: Option<std::path::PathBuf> = match &m.src {
+            crate::model::Source::Gguf(g) => g.paths.first().cloned(),
+            _ => None,
+        };
+        let tier_state = model_path.as_ref().map(|p| (crate::tier::state_path(p), crate::tier::model_id(p)));
+        let learned = tier_state
+            .as_ref()
+            .and_then(|(s, id)| crate::tier::load(s, id, c.n_layers, c.n_experts))
+            .unwrap_or_else(|| crate::tier::Learned::new(c.n_layers * c.n_experts));
         let rank: Option<Vec<(usize, usize)>> = match &pl.rank {
             None => None,
             Some(p) => {
@@ -614,6 +624,13 @@ impl<'m> GpuModel<'m> {
                 }
                 Some(r)
             }
+        };
+        // learned usage reorders the startup placement (GPU stores, then arena, then file) toward what this machine uses
+        let rank = if learned.tokens > 0.0 {
+            eprintln!("tier: placement from {:.0} learned tokens ({:.0}% learned, {:.0}% shipped ranking)", learned.tokens, learned.alpha() * 100.0, (1.0 - learned.alpha()) * 100.0);
+            Some(crate::tier::blend_rank(&prior, &learned, c.n_layers, c.n_experts))
+        } else {
+            rank
         };
         // static stores take the hottest experts first; the adaptive ones (the main GPU, fast-linked aux GPUs) the next
         let caps: Vec<usize> = std::iter::once(gpu0_bytes).chain(aux_g.iter().map(|a| a.1)).collect();
@@ -676,6 +693,8 @@ impl<'m> GpuModel<'m> {
                 })
                 .collect();
             let ms: &'static Model = unsafe { std::mem::transmute::<&Model, &'static Model>(m) };
+            let mut file_only: Vec<(usize, usize)> =
+                (0..c.n_experts).flat_map(|e| (0..c.n_layers).map(move |l| (l, e))).filter(|&(l, e)| on_cpu[l][e]).collect();
             let arena: Option<&'static crate::experts::Arena> = if pl.arena_gb > 0.0 {
                 let order: Vec<(usize, usize)> = rank.clone().unwrap_or_else(|| (0..c.n_experts).flat_map(|e| (0..c.n_layers).map(move |l| (l, e))).collect());
                 // the CPU's experts, and those an adaptive store may evict back to it
@@ -690,6 +709,7 @@ impl<'m> GpuModel<'m> {
                 let t = std::time::Instant::now();
                 let (a, rest) = crate::experts::Arena::new(m, &cpu, (pl.arena_gb * 1e9) as usize)?;
                 eprintln!("arena: {} experts, {:.1} GB in {:.0} s; {} left in the file", a.slots.len(), a.bytes as f64 / 1e9, t.elapsed().as_secs_f64(), rest.len());
+                file_only = rest.clone();
                 // If O_DIRECT was unavailable the arena filled through the mmap: evict those pages again now that the
                 // arena owns the bytes, before the server starts serving at near-full RAM.
                 m.drop_page_cache();
@@ -698,7 +718,28 @@ impl<'m> GpuModel<'m> {
                 None
             };
             gm.arena = arena;
+            let tier = crate::tier::Tier::init(c.n_layers, c.n_experts);
             gm.worker = Some(crate::handoff::CpuWorker::spawn(ms, xch, on_cpu, c.top_k, arena));
+            if let (Some(path), Some((state, id))) = (model_path.clone(), tier_state.clone()) {
+                // the rest runs in the background: learn, warm the page cache and fill an SSD buffer while idle
+                let lens: Vec<[u32; 3]> = (0..c.n_layers)
+                    .flat_map(|l| (0..c.n_experts).map(move |e| (l, e)))
+                    .map(|(l, e)| {
+                        let x = &m.layers[l].experts[e];
+                        [x.gate.bytes().len() as u32, x.up.bytes().len() as u32, x.down.bytes().len() as u32]
+                    })
+                    .collect();
+                let fo_bytes: u64 = file_only.iter().map(|&(l, e)| lens[l * c.n_experts + e].iter().map(|&n| n as u64).sum::<u64>()).sum();
+                let hdd = crate::tier::rotational(&path) == Some(true);
+                if hdd {
+                    crate::tier::attach_ssd(tier, &path, lens, fo_bytes);
+                }
+                eprintln!("tier: {} experts in the file ({:.1} GB) on {}; usage state {}", file_only.len(), fo_bytes as f64 / 1e9,
+                          if hdd { "a rotational disk" } else { "flash" }, state.display());
+                let bg = crate::tier::Background { tier, state, id, top_k: c.top_k, file_only, learned: learned.clone(), model_hdd: hdd };
+                let mb: &'static ModelExperts = Box::leak(Box::new(ModelExperts(ms)));
+                let _ = std::thread::Builder::new().name("tier".into()).spawn(move || bg.run(mb));
+            }
             // adaptive residency starts from the calibration prior: each expert's expected decayed score (its share of
             // the calibration tokens per layer x 1 / (1 - decay)), so placed experts keep their slots until the live
             // routing disagrees, instead of every slot looking idle at the first token
@@ -2511,5 +2552,15 @@ impl GpuModel<'_> {
             s0 = e;
         }
         logits.ok_or_else(|| anyhow::anyhow!("empty prompt"))
+    }
+}
+
+/// The model's expert bytes for the tiering thread (slices of the mapped model file).
+struct ModelExperts(&'static Model);
+
+impl crate::tier::ExpertBytes for ModelExperts {
+    fn parts(&self, l: usize, e: usize) -> [&[u8]; 3] {
+        let x = &self.0.layers[l].experts[e];
+        [x.gate.bytes(), x.up.bytes(), x.down.bytes()]
     }
 }
