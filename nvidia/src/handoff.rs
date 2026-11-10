@@ -314,8 +314,8 @@ impl CpuWorker {
                             a.store((f32::from_bits(a.load(Ordering::Relaxed)) + 1.0).to_bits(), Ordering::Relaxed);
                             pk[0].fetch_add(1, Ordering::Relaxed);
                             if !oc[l * ne + e].load(Ordering::Relaxed) {
-                                if let Some(t) = tier {
-                                    t.note_hit(crate::tier::Hit::Gpu, 1);
+                                if let Some(tr) = tier {
+                                    tr.note_gpu(l, e);
                                 }
                                 continue;
                             }

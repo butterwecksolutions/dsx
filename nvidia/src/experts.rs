@@ -707,7 +707,9 @@ impl GpuExperts {
 /// given, else layer-major round robin from expert 0). Stores with a lower `group` fill first (static stores before
 /// adaptive ones, which reshuffle at run time anyway); within a group each expert goes to the least-filled store
 /// that has room, so the hot experts, and the decode work, spread evenly over GPUs that run in parallel.
-pub fn place(m: &Model, rank: Option<&[(usize, usize)]>, caps: &[usize], group: &[u8]) -> Vec<Vec<(usize, usize)>> {
+/// `cost`: each store's measured cost per expert pick relative to the fastest (tier.rs); when given, every store is in
+/// one group and a store counts as `cost` times as full, so the hottest experts go preferably to the faster GPUs.
+pub fn place(m: &Model, rank: Option<&[(usize, usize)]>, caps: &[usize], group: &[u8], cost: Option<&[f64]>) -> Vec<Vec<(usize, usize)>> {
     let c = &m.cfg;
     let order: Vec<(usize, usize)> = match rank {
         Some(r) => r.to_vec(),
@@ -718,7 +720,7 @@ pub fn place(m: &Model, rank: Option<&[(usize, usize)]>, caps: &[usize], group: 
         x.gate.bytes().len() + x.up.bytes().len() + x.down.bytes().len()
     };
     let mut out = vec![vec![]; caps.len()];
-    for ((l, e), st) in order.iter().zip(assign(order.iter().map(|&(l, e)| size(l, e)), caps, group)) {
+    for ((l, e), st) in order.iter().zip(assign(order.iter().map(|&(l, e)| size(l, e)), caps, group, cost)) {
         if let Some(i) = st {
             out[i].push((*l, *e));
         }
@@ -727,12 +729,14 @@ pub fn place(m: &Model, rank: Option<&[(usize, usize)]>, caps: &[usize], group: 
 }
 
 /// place's fill rule on sizes: the store each item goes to (None = no room anywhere)
-fn assign(sizes: impl Iterator<Item = usize>, caps: &[usize], group: &[u8]) -> Vec<Option<usize>> {
+fn assign(sizes: impl Iterator<Item = usize>, caps: &[usize], group: &[u8], cost: Option<&[f64]>) -> Vec<Option<usize>> {
     let mut used = vec![0usize; caps.len()];
+    let grp = |i: usize| if cost.is_some() { 0 } else { group[i] };
+    let w = |i: usize| cost.and_then(|c| c.get(i).copied()).unwrap_or(1.0);
     sizes
         .map(|s| {
-            let fill = |i: usize| used[i] as f64 / caps[i] as f64;
-            let pick = (0..caps.len()).filter(|&i| used[i] + s <= caps[i]).min_by(|&i, &j| group[i].cmp(&group[j]).then(fill(i).total_cmp(&fill(j))));
+            let fill = |i: usize| used[i] as f64 / caps[i] as f64 * w(i);
+            let pick = (0..caps.len()).filter(|&i| used[i] + s <= caps[i]).min_by(|&i, &j| grp(i).cmp(&grp(j)).then(fill(i).total_cmp(&fill(j))));
             if let Some(i) = pick {
                 used[i] += s;
             }
@@ -746,14 +750,24 @@ mod place_tests {
     #[test]
     fn static_first_then_balanced() {
         // two static aux stores of 2 and one adaptive main store of 3; 8 unit experts, the last one has no room
-        let o = super::assign([1usize; 8].into_iter(), &[2, 2, 3], &[0, 0, 1]);
+        let o = super::assign([1usize; 8].into_iter(), &[2, 2, 3], &[0, 0, 1], None);
         assert_eq!(o, vec![Some(0), Some(1), Some(0), Some(1), Some(2), Some(2), Some(2), None]);
+    }
+
+    #[test]
+    fn measured_cost_sends_the_hottest_to_the_faster_store() {
+        // equal stores of 6; the second costs 2x per pick: of the first 6 experts (hottest), 4 go to the first
+        let o = super::assign([1usize; 6].into_iter(), &[6, 6], &[1, 0], Some(&[1.0, 2.0]));
+        assert_eq!(o.iter().filter(|x| **x == Some(0)).count(), 4);
+        // without measurements the groups decide as before
+        let o = super::assign([1usize; 2].into_iter(), &[6, 6], &[1, 0], None);
+        assert_eq!(o, vec![Some(1), Some(1)]);
     }
 
     #[test]
     fn two_store_order_unchanged() {
         // the old two-store rule: GPU1 (static) first, GPU0 takes what does not fit, smaller ones still go to GPU1
-        let o = super::assign([3usize, 3, 1].into_iter(), &[4, 10], &[0, 1]);
+        let o = super::assign([3usize, 3, 1].into_iter(), &[4, 10], &[0, 1], None);
         assert_eq!(o, vec![Some(0), Some(1), Some(0)]);
     }
 }

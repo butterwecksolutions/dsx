@@ -173,6 +173,14 @@ pub struct GpuModel<'m> {
     pub adapt_s: f64,
     /// on_cpu flag changes from adapt_step, applied after the token's sync (the CPU worker may still be running the token)
     adapt_flags: Vec<(usize, bool)>,
+    /// automatic tiering (tier.rs): fixed-set stores take run-time moves; moves in flight ((layer, expert), prefetch slot)
+    tier_swap: bool,
+    tier_moves: Vec<((usize, usize), usize)>,
+    pub tier_swaps: usize,
+    /// decode tokens so far, and the layer whose expert kernels this token times (every tier::SAMPLE_EVERY tokens)
+    tier_tokens: u64,
+    tier_sample: Option<usize>,
+    tev0: Option<[crate::gpu::Event; 2]>,
     /// one-token Q8_0 GEMVs on gemv_q8r1 (DSX_Q8R1=0: gemv_q8r, for A/Bs)
     q8r1: bool,
     /// one-token split-k GEMVs on the *_sk1 kernels (DSX_SK1=0: the generic ones, for A/Bs)
@@ -244,6 +252,8 @@ struct Aux {
     adaptive: bool,
     /// DSX_EVPROF: [layer][4] timed events
     ev: Vec<crate::gpu::Event>,
+    /// tiering: timed events around one sampled layer's experts
+    tev: Option<[crate::gpu::Event; 2]>,
 }
 
 /// A visible GPU as placement sees it.
@@ -486,6 +496,12 @@ impl<'m> GpuModel<'m> {
             adapt_swaps: 0,
             adapt_s: 0.0,
             adapt_flags: vec![],
+            tier_swap: false,
+            tier_moves: vec![],
+            tier_swaps: 0,
+            tier_tokens: 0,
+            tier_sample: None,
+            tev0: None,
             q8r1: std::env::var("DSX_Q8R1").map_or(true, |v| v != "0"),
             sk1: std::env::var("DSX_SK1").map_or(true, |v| v != "0"),
             combine_fused: std::env::var("DSX_COMBINE_FUSED").map_or(true, |v| v != "0"),
@@ -596,16 +612,27 @@ impl<'m> GpuModel<'m> {
             }
         }
         let mut prior: Vec<(usize, usize, u64)> = vec![];
-        // automatic tiering (tier.rs): the usage this machine learned in earlier runs, if any
-        let model_path: Option<std::path::PathBuf> = match &m.src {
-            crate::model::Source::Gguf(g) => g.paths.first().cloned(),
-            _ => None,
+        // automatic tiering (tier.rs): what this machine learned in earlier runs with this model (and overlay), if anything
+        let model_paths: Vec<std::path::PathBuf> = match &m.src {
+            crate::model::Source::Gguf(g) => g.paths.clone(),
+            _ => vec![],
         };
-        let tier_state = model_path.as_ref().map(|p| (crate::tier::state_path(p), crate::tier::model_id(p)));
-        let learned = tier_state
+        let tier_state = (!model_paths.is_empty())
+            .then(|| (crate::tier::state_path(&model_paths), crate::tier::models_id(&model_paths), crate::tier::state_name(&model_paths)));
+        let legacy = crate::tier::legacy_state_path(&model_paths).filter(|l| tier_state.as_ref().is_none_or(|t| &t.0 != l));
+        if crate::tier::reset_requested() {
+            if let Some((st, _, name)) = &tier_state {
+                let n = crate::tier::reset_files(st, legacy.as_deref(), name);
+                eprintln!("tier: reset ({n} files removed): starting from the shipped ranking");
+            }
+        }
+        let saved = tier_state
             .as_ref()
-            .and_then(|(s, id)| crate::tier::load(s, id, c.n_layers, c.n_experts))
-            .unwrap_or_else(|| crate::tier::Learned::new(c.n_layers * c.n_experts));
+            .and_then(|(st, id, _)| {
+                crate::tier::load(st, id, c.n_layers, c.n_experts).or_else(|| legacy.as_ref().and_then(|l| crate::tier::load(l, id, c.n_layers, c.n_experts)))
+            })
+            .unwrap_or_else(|| crate::tier::Saved::new(c.n_layers * c.n_experts));
+        let learned = saved.learned.clone();
         let rank: Option<Vec<(usize, usize)>> = match &pl.rank {
             None => None,
             Some(p) => {
@@ -635,8 +662,17 @@ impl<'m> GpuModel<'m> {
         // static stores take the hottest experts first; the adaptive ones (the main GPU, fast-linked aux GPUs) the next
         let caps: Vec<usize> = std::iter::once(gpu0_bytes).chain(aux_g.iter().map(|a| a.1)).collect();
         let group: Vec<u8> = std::iter::once(1).chain(aux_g.iter().map(|a| a.2 as u8)).collect();
+        // GPUs by UUID (stable across CUDA_VISIBLE_DEVICES): with an expert cost measured for each in earlier runs, the
+        // hottest experts go preferably to the faster ones
+        let uuids: Vec<String> = std::iter::once(crate::gpu::uuid(ordinal)).chain(aux_g.iter().map(|a| crate::gpu::uuid(a.0.ordinal))).collect();
+        gm.g.bind();
+        let costs = if caps.len() > 1 { crate::tier::store_costs(&saved, &uuids) } else { None };
+        if let Some(cs) = &costs {
+            eprintln!("tier: measured expert cost per GPU (fastest = 1): {}", cs.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(", "));
+        }
+        let mut tier_stores: Vec<crate::tier::StoreInfo> = vec![];
         if caps.iter().any(|&b| b > 0) {
-            let sets = crate::experts::place(m, rank.as_deref(), &caps, &group);
+            let sets = crate::experts::place(m, rank.as_deref(), &caps, &group, costs.as_deref());
             // staging for in-flight replacements: the largest expert's raw bytes
             let max_raw = (0..c.n_layers)
                 .flat_map(|l| (0..c.n_experts).map(move |e| (l, e)))
@@ -648,9 +684,24 @@ impl<'m> GpuModel<'m> {
                 // DSX_ADAPT_EARLY: replacements start before a token's sync and commit after the next token's, so a stage is
                 // busy for two tokens and twice the stages are needed
                 s0.enable_swaps(&gm.g, if adapt_early() { 2 } else { 1 } * gm.adapt, max_raw)?;
+                // tiering: a fixed set takes run-time moves, one at a time (one staging buffer)
+                let tier_moves = gm.adapt == 0 && s0.is_fast();
+                if tier_moves {
+                    s0.enable_swaps(&gm.g, 1, max_raw)?;
+                }
+                tier_stores.push(crate::tier::StoreInfo {
+                    uuid: uuids[0].clone(),
+                    name: gm.g.name.clone(),
+                    link_gbs: probe.iter().find(|p| p.ordinal == ordinal).map_or(0.0, |p| p.h2d_gbs),
+                    tier_swaps: tier_moves,
+                });
                 gm.exp0 = Some(s0);
+            } else {
+                // store 0 is always the main GPU's (tier.rs locations count stores from it)
+                tier_stores.push(crate::tier::StoreInfo { uuid: uuids[0].clone(), name: gm.g.name.clone(), link_gbs: 0.0, tier_swaps: false });
             }
-            let mut msg = format!("experts resident: GPU{ordinal} {} ({:.1} GB)", sets[0].len(), gm.exp0.as_ref().map_or(0, |x| x.bytes) as f64 / 1e9);
+            let mut msg = format!("experts resident: GPU{ordinal} {} ({:.1} GB{})", sets[0].len(), gm.exp0.as_ref().map_or(0, |x| x.bytes) as f64 / 1e9,
+                                  if tier_stores[0].tier_swaps { ", tier moves" } else { "" });
             for ((ga, _, adaptive, stream, bw), set) in aux_g.into_iter().zip(sets.iter().skip(1)) {
                 if set.is_empty() {
                     continue;
@@ -662,9 +713,15 @@ impl<'m> GpuModel<'m> {
                     let n = std::env::var("DSX_ADAPT_AUX").ok().and_then(|v| v.parse().ok()).unwrap_or(gm.adapt);
                     exp.enable_swaps(&ga, if adapt_early() { 2 } else { 1 } * n, max_raw)?;
                 }
+                let tier_moves = !adaptive && exp.is_fast();
+                if tier_moves {
+                    exp.enable_swaps(&ga, 1, max_raw)?;
+                }
+                tier_stores.push(crate::tier::StoreInfo { uuid: crate::gpu::uuid(ga.ordinal), name: ga.name.clone(), link_gbs: bw, tier_swaps: tier_moves });
                 let pre = if pl.prefill_chunk > 0 { Some(prefill::AuxPrefill::new(&ga, m, pl.prefill_chunk, stream, bw)?) } else { None };
-                msg += &format!(", GPU{} {} ({:.1} GB, {}{}, {bw:.1} GB/s link)", ga.ordinal, set.len(), exp.bytes as f64 / 1e9, if adaptive { "adaptive" } else { "static" }, if stream { ", streams prefill experts" } else { "" });
-                gm.aux.push(Aux { g: ga, exp, pre, xdev: 0, adaptive, ev: vec![] });
+                msg += &format!(", GPU{} {} ({:.1} GB, {}{}, {bw:.1} GB/s link)", ga.ordinal, set.len(), exp.bytes as f64 / 1e9,
+                                if adaptive { "adaptive" } else if tier_moves { "static, tier moves" } else { "static" }, if stream { ", streams prefill experts" } else { "" });
+                gm.aux.push(Aux { g: ga, exp, pre, xdev: 0, adaptive, ev: vec![], tev: None });
             }
             gm.g.bind();
             eprintln!("{msg}");
@@ -693,8 +750,6 @@ impl<'m> GpuModel<'m> {
                 })
                 .collect();
             let ms: &'static Model = unsafe { std::mem::transmute::<&Model, &'static Model>(m) };
-            let mut file_only: Vec<(usize, usize)> =
-                (0..c.n_experts).flat_map(|e| (0..c.n_layers).map(move |l| (l, e))).filter(|&(l, e)| on_cpu[l][e]).collect();
             let arena: Option<&'static crate::experts::Arena> = if pl.arena_gb > 0.0 {
                 let order: Vec<(usize, usize)> = rank.clone().unwrap_or_else(|| (0..c.n_experts).flat_map(|e| (0..c.n_layers).map(move |l| (l, e))).collect());
                 // the CPU's experts, and those an adaptive store may evict back to it
@@ -709,7 +764,6 @@ impl<'m> GpuModel<'m> {
                 let t = std::time::Instant::now();
                 let (a, rest) = crate::experts::Arena::new(m, &cpu, (pl.arena_gb * 1e9) as usize)?;
                 eprintln!("arena: {} experts, {:.1} GB in {:.0} s; {} left in the file", a.slots.len(), a.bytes as f64 / 1e9, t.elapsed().as_secs_f64(), rest.len());
-                file_only = rest.clone();
                 // If O_DIRECT was unavailable the arena filled through the mmap: evict those pages again now that the
                 // arena owns the bytes, before the server starts serving at near-full RAM.
                 m.drop_page_cache();
@@ -720,24 +774,77 @@ impl<'m> GpuModel<'m> {
             gm.arena = arena;
             let tier = crate::tier::Tier::init(c.n_layers, c.n_experts);
             gm.worker = Some(crate::handoff::CpuWorker::spawn(ms, xch, on_cpu, c.top_k, arena));
-            if let (Some(path), Some((state, id))) = (model_path.clone(), tier_state.clone()) {
-                // the rest runs in the background: learn, warm the page cache and fill an SSD buffer while idle
+            if let (Some(path), Some((state, id, name))) = (model_paths.first().cloned(), tier_state.clone()) {
+                let ne = c.n_experts;
+                // where every expert is computed from now: a GPU store, the arena, else the file side
+                for l in 0..c.n_layers {
+                    for e in 0..ne {
+                        let loc = if gm.exp0.as_ref().is_some_and(|s| s.has(l, e)) {
+                            crate::tier::LOC_GPU
+                        } else if let Some(i) = gm.aux.iter().position(|a| a.exp.has(l, e)) {
+                            crate::tier::LOC_GPU + 1 + i as u8
+                        } else if arena.is_some_and(|a| a.get(l, e).is_some()) {
+                            crate::tier::LOC_ARENA
+                        } else {
+                            crate::tier::LOC_FILE
+                        };
+                        tier.set_loc(l, e, loc);
+                    }
+                }
+                // experts swap only within the same quant types
+                let mut kinds: HashMap<(crate::gguf::GType, crate::gguf::GType), u32> = HashMap::new();
+                let keys: Vec<u32> = (0..c.n_layers * ne)
+                    .map(|i| {
+                        let x = &m.layers[i / ne].experts[i % ne];
+                        let n = kinds.len() as u32;
+                        *kinds.entry((x.gate.ty, x.down.ty)).or_insert(n)
+                    })
+                    .collect();
+                tier.set_keys(keys);
                 let lens: Vec<[u32; 3]> = (0..c.n_layers)
-                    .flat_map(|l| (0..c.n_experts).map(move |e| (l, e)))
+                    .flat_map(|l| (0..ne).map(move |e| (l, e)))
                     .map(|(l, e)| {
                         let x = &m.layers[l].experts[e];
                         [x.gate.bytes().len() as u32, x.up.bytes().len() as u32, x.down.bytes().len() as u32]
                     })
                     .collect();
-                let fo_bytes: u64 = file_only.iter().map(|&(l, e)| lens[l * c.n_experts + e].iter().map(|&n| n as u64).sum::<u64>()).sum();
-                let hdd = crate::tier::rotational(&path) == Some(true);
-                if hdd {
-                    crate::tier::attach_ssd(tier, &path, lens, fo_bytes);
+                if tier_stores.iter().any(|s| s.tier_swaps) {
+                    // pinned slots for the experts on their way to a GPU (the background thread fills them)
+                    let max_raw = lens.iter().map(|l| l.iter().map(|&n| n as usize).sum::<usize>()).max().unwrap_or(0);
+                    match crate::gpu::HostBuf::new(crate::tier::PREFETCH_SLOTS * max_raw) {
+                        Ok(b) => {
+                            let b: &'static crate::gpu::HostBuf = Box::leak(Box::new(b));
+                            tier.set_prefetch(crate::tier::Prefetch::new(b.host_ptr(), max_raw, crate::tier::PREFETCH_SLOTS));
+                            gm.tier_swap = true;
+                        }
+                        Err(e) => eprintln!("tier: no prefetch buffer ({e}): GPU sets stay as placed"),
+                    }
+                    gm.g.bind();
                 }
-                eprintln!("tier: {} experts in the file ({:.1} GB) on {}; usage state {}", file_only.len(), fo_bytes as f64 / 1e9,
-                          if hdd { "a rotational disk" } else { "flash" }, state.display());
-                let bg = crate::tier::Background { tier, state, id, top_k: c.top_k, file_only, learned: learned.clone(), model_hdd: hdd };
-                let mb: &'static ModelExperts = Box::leak(Box::new(ModelExperts(ms)));
+                tier.set_stores(tier_stores.clone());
+                if gm.exp0.is_some() {
+                    gm.tev0 = Some([gm.g.timed_event()?, gm.g.timed_event()?]);
+                }
+                for a in gm.aux.iter_mut() {
+                    a.tev = Some([a.g.timed_event()?, a.g.timed_event()?]);
+                }
+                gm.g.bind();
+                let file_side: Vec<(usize, usize)> = (0..c.n_layers * ne).filter(|&i| tier.loc(i) == crate::tier::LOC_FILE).map(|i| (i / ne, i % ne)).collect();
+                let fs_bytes: u64 = file_side.iter().map(|&(l, e)| lens[l * ne + e].iter().map(|&n| n as u64).sum::<u64>()).sum();
+                // the model's medium, measured: a slow one (HDD, network, SATA) gets an SSD buffer for the file side
+                let read = crate::tier::measure_read_mb_s(&path);
+                let slow = crate::tier::rotational(&path) == Some(true) || read.is_some_and(|v| v < crate::tier::SLOW_READ_MB_S);
+                if slow && fs_bytes > 0 {
+                    crate::tier::attach_ssd(tier, &path, &id, &name, lens, fs_bytes);
+                }
+                eprintln!("tier: {} experts on the file side ({:.1} GB), model medium {}{}; state {}", file_side.len(), fs_bytes as f64 / 1e9,
+                          read.map_or("unmeasured".to_string(), |v| format!("{v:.0} MB/s")), if slow { " (slow)" } else { "" }, state.display());
+                let files: Vec<String> = model_paths.iter().map(|p| p.display().to_string()).collect();
+                let bg = crate::tier::Background {
+                    tier, state, id, files, top_k: c.top_k, saved,
+                    model_disk: crate::tier::disk_key(&path), model_read_mb_s: read, slow_media: slow,
+                };
+                let mb: &'static ModelExperts = Box::leak(Box::new(ModelExperts(ms, arena)));
                 let _ = std::thread::Builder::new().name("tier".into()).spawn(move || bg.run(mb));
             }
             // adaptive residency starts from the calibration prior: each expert's expected decayed score (its share of
@@ -793,10 +900,17 @@ impl<'m> GpuModel<'m> {
                 g1.htod(s1.wts.ptr, xch.wts(t * c.top_k))?;
                 g1.htod(s1.x.ptr, xch.x(t))?;
                 ev(1)?;
+                let timed = if t == 1 && self.tier_sample == Some(li) { a.tev } else { None };
+                if let Some([e0, _]) = timed {
+                    g1.record(e0, false)?;
+                }
                 if t == 1 {
                     s1.run_device(g1, li, s1.sel.ptr, s1.wts.ptr, c.top_k, s1.x.ptr, s1.out.ptr)?;
                 } else {
                     s1.run_device_fast(g1, li, s1.sel.ptr, s1.wts.ptr, c.top_k, t, s1.x.ptr, s1.out.ptr)?;
+                }
+                if let Some([_, e1]) = timed {
+                    g1.record(e1, false)?;
                 }
                 ev(2)?;
                 g1.dtoh(xch.y_aux(i, t), s1.out.ptr)?;
@@ -856,10 +970,17 @@ impl<'m> GpuModel<'m> {
         } else {
             self.g.launch(self.k["publish_route"], (1, 1, 1), 1024, 0, &[Arg::P(idx_buf), Arg::P(idx_buf + 256), Arg::I(c.top_k as i32), Arg::P(x), Arg::I(d as i32), Arg::P(d0), Arg::I(seq as i32), Arg::I(t as i32)])?;
         }
+        let timed = if t == 1 && self.tier_sample == Some(li) { self.tev0 } else { None };
+        if let Some([a, _]) = timed {
+            self.g.record(a, false)?;
+        }
         match self.exp0.as_ref() {
             Some(s0) if t == 1 => s0.run_device(&self.g, li, idx_buf, idx_buf + 256, c.top_k, x, self.out0.ptr)?,
             Some(s0) => s0.run_device_fast(&self.g, li, idx_buf, idx_buf + 256, c.top_k, t, x, self.out0.ptr)?,
             None => self.g.memset(self.out0.ptr, t * d * 4)?,
+        }
+        if let Some([_, b]) = timed {
+            self.g.record(b, false)?;
         }
         self.ev(li, 3)?;
         let inter = c.inter;
@@ -965,6 +1086,10 @@ impl<'m> GpuModel<'m> {
     fn adapt_step(&mut self) -> Result<()> {
         let ne = self.m.cfg.n_experts;
         let (Some(w), Some(arena)) = (self.worker.as_ref(), self.arena) else { return Ok(()) };
+        // replacements in flight on any store, tiering's included
+        let pending: std::collections::HashSet<(usize, usize)> =
+            self.exp0.iter().flat_map(|s| s.pending()).chain(self.aux.iter().flat_map(|a| a.exp.pending())).collect();
+        let tier = crate::tier::global();
         let flags = &mut self.adapt_flags;
         let mut stores: Vec<(&Gpu, &mut crate::experts::GpuExperts)> =
             self.exp0.as_mut().map(|s| (&self.g, s)).into_iter().chain(self.aux.iter_mut().filter(|a| a.adaptive).map(|a| (&a.g, &mut a.exp))).collect();
@@ -974,7 +1099,6 @@ impl<'m> GpuModel<'m> {
             return Ok(());
         }
         let sc = |l: usize, e: usize| f32::from_bits(w.score[l * ne + e].load(std::sync::atomic::Ordering::Relaxed));
-        let pending: std::collections::HashSet<(usize, usize)> = stores.iter().flat_map(|(_, s)| s.pending()).collect();
         let mut cand: Vec<(f32, usize, usize)> = (0..w.score.len())
             .filter_map(|i| {
                 let (l, e) = (i / ne, i % ne);
@@ -1021,6 +1145,9 @@ impl<'m> GpuModel<'m> {
                 break;
             }
             flags.push((vl * ne + ve, true));
+            if let Some(t) = tier {
+                t.set_loc(vl, ve, if arena.get(vl, ve).is_some() { crate::tier::LOC_ARENA } else { crate::tier::LOC_FILE });
+            }
             started += 1;
             self.adapt_swaps += 1;
         }
@@ -1029,26 +1156,102 @@ impl<'m> GpuModel<'m> {
 
     /// After a token's sync: make finished replacements resident (table writes precede the next token's kernels)
     fn adapt_commit(&mut self) -> Result<()> {
+        self.commit_swaps(false)
+    }
+
+    /// Before a multi-token pass (prefill, verify, eval): finish and commit every in-flight replacement.
+    pub(crate) fn adapt_flush(&mut self) -> Result<()> {
+        self.commit_swaps(true)
+    }
+
+    /// Commit finished replacements on every store that swaps (adaptive ones, and fixed sets taking tiering's moves):
+    /// the CPU stops computing the new experts, tiering learns their store and frees their prefetch slots.
+    fn commit_swaps(&mut self, all: bool) -> Result<()> {
         let ne = self.m.cfg.n_experts;
         let Some(w) = self.worker.as_ref() else { return Ok(()) };
-        let stores = self.exp0.as_mut().map(|s| (&self.g, s)).into_iter().chain(self.aux.iter_mut().filter(|a| a.adaptive).map(|a| (&a.g, &mut a.exp)));
-        for (g, s) in stores {
-            for (l, e) in s.commit_ready(g, false)? {
-                w.on_cpu[l * ne + e].store(false, std::sync::atomic::Ordering::Relaxed);
+        let tier = crate::tier::global();
+        let mut done: Vec<(usize, usize, usize)> = vec![];
+        if let Some(s) = self.exp0.as_mut() {
+            for (l, e) in s.commit_ready(&self.g, all)? {
+                done.push((0, l, e));
+            }
+        }
+        for (i, a) in self.aux.iter_mut().enumerate() {
+            for (l, e) in a.exp.commit_ready(&a.g, all)? {
+                done.push((i + 1, l, e));
+            }
+        }
+        for (st, l, e) in done {
+            w.on_cpu[l * ne + e].store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(t) = tier {
+                t.set_loc(l, e, crate::tier::LOC_GPU + st as u8);
+                if let Some(k) = self.tier_moves.iter().position(|m| m.0 == (l, e)) {
+                    let (_, slot) = self.tier_moves.swap_remove(k);
+                    if let Some(pf) = t.prefetch() {
+                        pf.release(slot);
+                    }
+                }
             }
         }
         self.g.bind();
         Ok(())
     }
 
-    /// Before a multi-token pass (prefill, verify, eval): finish and commit every in-flight replacement.
-    pub(crate) fn adapt_flush(&mut self) -> Result<()> {
-        let ne = self.m.cfg.n_experts;
-        let Some(w) = self.worker.as_ref() else { return Ok(()) };
-        let stores = self.exp0.as_mut().map(|s| (&self.g, s)).into_iter().chain(self.aux.iter_mut().filter(|a| a.adaptive).map(|a| (&a.g, &mut a.exp)));
-        for (g, s) in stores {
-            for (l, e) in s.commit_ready(g, true)? {
-                w.on_cpu[l * ne + e].store(false, std::sync::atomic::Ordering::Relaxed);
+    /// Between tokens: start at most one of tiering's planned moves (an expert on no GPU into a fixed-set store, in
+    /// place of a clearly colder resident of the same types). The plan is checked against the current state; a stale
+    /// one is dropped. Same protocol as adapt_step: the victim leaves the table now and the CPU computes it from the
+    /// next token on; the new expert becomes resident at commit, after its copy completed.
+    fn tier_step(&mut self) -> Result<()> {
+        let (Some(t), Some(w)) = (crate::tier::global(), self.worker.as_ref()) else { return Ok(()) };
+        let Some(pf) = t.prefetch() else { return Ok(()) };
+        let Some((slot, mv)) = pf.take() else { return Ok(()) };
+        let m = self.m;
+        let ne = m.cfg.n_experts;
+        let ((l, e), (vl, ve)) = (mv.new, mv.victim);
+        let x = &m.layers[l].experts[e];
+        let types = (x.gate.ty, x.down.ty);
+        let busy = self.exp0.iter().flat_map(|s| s.pending()).chain(self.aux.iter().flat_map(|a| a.exp.pending())).any(|p| p == (l, e) || p == (vl, ve));
+        let free = !busy && !self.resident(l, e) && w.on_cpu[l * ne + e].load(std::sync::atomic::Ordering::Relaxed);
+        let arena_has = self.arena.is_some_and(|a| a.get(vl, ve).is_some());
+        let target: Option<(&Gpu, &mut crate::experts::GpuExperts)> = match mv.store {
+            0 if self.adapt == 0 => self.exp0.as_mut().map(|s| (&self.g, s)),
+            i => self.aux.get_mut(i.wrapping_sub(1)).filter(|a| !a.adaptive).map(|a| (&a.g, &mut a.exp)),
+        };
+        let mut started = false;
+        if let (true, Some((g, s)), Some(raw)) = (free, target, pf.parts(slot)) {
+            if s.has(vl, ve) && s.swap_room() > 0 && s.types(vl, ve) == Some(types) && raw[0].len() == x.gate.bytes().len() {
+                started = s.begin_swap(g, (vl, ve), (l, e), raw)?;
+            }
+        }
+        if started {
+            self.adapt_flags.push((vl * ne + ve, true));
+            t.set_loc(vl, ve, if arena_has { crate::tier::LOC_ARENA } else { crate::tier::LOC_FILE });
+            self.tier_moves.push(((l, e), slot));
+            self.tier_swaps += 1;
+        } else {
+            pf.release(slot);
+        }
+        self.g.bind();
+        Ok(())
+    }
+
+    /// After a sampled token's sync: its timed layer's expert-kernel time per store, for tiering's GPU measurements.
+    fn tier_collect(&mut self) -> Result<()> {
+        if self.tier_sample.take().is_none() {
+            return Ok(());
+        }
+        let Some(t) = crate::tier::global() else { return Ok(()) };
+        if let Some([a, b]) = self.tev0 {
+            if self.g.done(b)? {
+                t.note_gpu_ms(0, self.g.elapsed_ms(a, b)? as f64);
+            }
+        }
+        for (i, x) in self.aux.iter().enumerate() {
+            if let Some([a, b]) = x.tev {
+                x.g.bind();
+                if x.g.done(b)? {
+                    t.note_gpu_ms(i + 1, x.g.elapsed_ms(a, b)? as f64);
+                }
             }
         }
         self.g.bind();
@@ -1746,6 +1949,9 @@ impl<'m> GpuModel<'m> {
         // DSX_ADAPT_EARLY=1: scan and start replacements before the sync (off: window 30 measured the same swap count but
         // CPU picks 22.9 -> 26.2% and KL 0.151 -> 0.159; cause not found yet)
         let early = adapt_early();
+        // tiering: time one layer's expert kernels every SAMPLE_EVERY tokens
+        self.tier_tokens += 1;
+        self.tier_sample = (crate::tier::global().is_some() && self.tier_tokens % crate::tier::SAMPLE_EVERY == 0).then_some(self.m.cfg.n_layers / 2);
         let r = self.step_inner(token).and_then(|()| {
             let t = std::time::Instant::now();
             if self.adapt > 0 && early {
@@ -1754,12 +1960,16 @@ impl<'m> GpuModel<'m> {
             self.adapt_s += t.elapsed().as_secs_f64();
             let l = self.g.download::<f32>(self.logits.ptr, self.m.cfg.vocab)?;
             let t = std::time::Instant::now();
-            if self.adapt > 0 {
+            if self.adapt > 0 || self.tier_swap {
                 self.adapt_commit()?;
-                if !early {
+                if self.adapt > 0 && !early {
                     self.adapt_step()?;
                 }
             }
+            if self.tier_swap {
+                self.tier_step()?;
+            }
+            self.tier_collect()?;
             if let Some(w) = self.worker.as_ref() {
                 for (i, v) in self.adapt_flags.drain(..) {
                     w.on_cpu[i].store(v, std::sync::atomic::Ordering::Relaxed);
@@ -2555,11 +2765,14 @@ impl GpuModel<'_> {
     }
 }
 
-/// The model's expert bytes for the tiering thread (slices of the mapped model file).
-struct ModelExperts(&'static Model);
+/// The model's expert bytes for the tiering thread: the arena's copy when it holds one, else the mapped file.
+struct ModelExperts(&'static Model, Option<&'static crate::experts::Arena>);
 
 impl crate::tier::ExpertBytes for ModelExperts {
     fn parts(&self, l: usize, e: usize) -> [&[u8]; 3] {
+        if let Some(p) = self.1.and_then(|a| a.get(l, e)) {
+            return p;
+        }
         let x = &self.0.layers[l].experts[e];
         [x.gate.bytes(), x.up.bytes(), x.down.bytes()]
     }
