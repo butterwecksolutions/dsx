@@ -7,23 +7,24 @@
 //! * **Usage.** The CPU worker counts every decode pick (`note_picks`), GPU-resident ones included, and which tier
 //!   served it. A background thread folds the counts into a long-term score (`HALF_LIFE_TOKENS`). Usage does not
 //!   depend on the hardware: one score serves every GPU combination the model is started with.
-//! * **Run time.** The thread plans moves of hot experts that live on no GPU onto GPU stores that keep fixed sets
-//!   otherwise (stores that already swap by recent use are left to that), each against a clearly colder resident of
-//!   the same type. It copies the expert into a pinned prefetch slot; the engine starts at most one copy per token
-//!   (`GpuExperts::begin_swap`: the victim leaves the store's table first and is computed by the CPU from then on,
-//!   the copy lands in its slot on the side stream, the new expert becomes resident only after the copy completed).
-//!   No arena copy of the victim is needed: the CPU reads it from the arena, the SSD buffer or the file.
-//! * **Idle.** With no decode for `IDLE_SECS`: the page cache is warmed with the hottest experts the CPU reads from
-//!   the file, and on a slow medium they are copied into an SSD buffer the CPU reads from at once.
-//! * **Measurement.** Per GPU (by UUID): host link, sampled expert time per pick; per medium: read speed; per GPU
-//!   combination: decode tokens/s and the share of expert reads that still hit the file.
-//! * **Startup.** The learned score is blended into `--rank` before placement, and with measured GPU speeds the
-//!   hottest experts go preferably to the faster GPU.
+//! * **Who is waited for.** Every 64th decode token one layer (rotating) is timed on the main GPU: after its own work
+//!   it waits for the CPU's experts, then for each aux GPU (`Waits`). The device that finishes last gets work taken
+//!   away: a late aux GPU exchanges its hottest experts for colder ones of the main GPU (`plan_exchanges`); a late CPU
+//!   hands hot experts to fixed-set GPU stores that are not late (`plan_moves`).
+//! * **Run time.** The plans' experts are copied into pinned prefetch slots by this thread; the engine starts them
+//!   between tokens (at most one per token) and in pauses back to back (`GpuModel::tier_step`, `tier_idle`), with the
+//!   protocol of adaptive replacement: a victim leaves its table first and the CPU computes it meanwhile; a new expert
+//!   enters a table only after its copy completed. No expert is ever resident on two GPUs.
+//! * **Pauses.** In every pause of `IDLE_MS` (no request running) this thread also warms the page cache with the hottest
+//!   experts the CPU reads from the file side and, on a slow medium, copies them into an SSD buffer.
+//! * **Measurement.** Per GPU (by UUID): host link, expert-kernel time of a layer, picks per token; per medium: read
+//!   speed; per GPU combination: decode tokens/s, the waits, CPU picks per token.
+//! * **Startup.** The learned score is blended into `--rank` before placement.
 //!
 //! State: `<model>.tier.json` next to the model (one per model file and overlay), else in `$DSX_STATE_DIR`,
-//! `$XDG_STATE_HOME/dsx`, `~/.local/state/dsx`, `/var/tmp/dsx`. Previous version kept as `.json.prev`; devices unseen
-//! for 90 days and all but the 16 most recent GPU combinations are dropped. `--tier-reset` starts from scratch. Any
-//! failure only disables the affected part; inference never depends on it.
+//! `$XDG_STATE_HOME/dsx`, `~/.local/state/dsx`, `/var/tmp/dsx`; saved every 2 minutes, busy or not. Previous version
+//! kept as `.json.prev`; devices unseen for 90 days and all but the 16 most recent GPU combinations are dropped.
+//! `--tier-reset` starts from scratch. Any failure only disables the affected part; inference never depends on it.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -36,8 +37,11 @@ use std::sync::{Mutex, OnceLock};
 pub const HALF_LIFE_TOKENS: f64 = 200_000.0;
 pub const ALPHA_FULL_TOKENS: f64 = 50_000.0;
 pub const ALPHA_MAX: f64 = 0.8;
-pub const IDLE_SECS: u64 = 30;
-const SAVE_EVERY_SECS: u64 = 300;
+/// a pause this long (no request running) counts as idle: run-time moves in bulk, page-cache warming, SSD copies
+pub const IDLE_MS: u64 = 2000;
+const SAVE_EVERY_SECS: u64 = 120;
+const REPORT_EVERY_SECS: u64 = 600;
+const TICK_MS: u64 = 200;
 const FOLD_EVERY_SECS: u64 = 10;
 const WARM_MAX_BYTES: u64 = 40 << 30;
 const MEM_RESERVE_BYTES: u64 = 16 << 30;
@@ -85,8 +89,10 @@ pub struct StoreInfo {
     pub uuid: String,
     pub name: String,
     pub link_gbs: f64,
-    /// fixed set otherwise: tiering may move experts into it at run time
+    /// fixed set otherwise: tiering may move experts from the CPU into it at run time
     pub tier_swaps: bool,
+    /// can replace experts at run time at all (adaptive, or taking tiering's moves): may take part in an exchange
+    pub swaps: bool,
 }
 
 pub struct Tier {
@@ -101,7 +107,8 @@ pub struct Tier {
     gpu_ms: Mutex<Vec<(f64, u64)>>,
     /// the main GPU's waits per layer after its own work (smoothed, µs): for the CPU's experts, then for the aux GPUs'
     waits: Mutex<Waits>,
-    last_decode: AtomicU64,
+    /// last activity (a decode pass, or a request starting or ending), µs since `t0`
+    last_busy_us: AtomicU64,
     /// decode passes: all of them, and those right after another (timed: `busy_us`)
     all_passes: AtomicU64,
     passes: AtomicU64,
@@ -150,7 +157,7 @@ impl Tier {
             store_picks: Default::default(),
             gpu_ms: Mutex::new(vec![(0.0, 0); MAX_STORES]),
             waits: Mutex::new(Waits::default()),
-            last_decode: AtomicU64::new(0),
+            last_busy_us: AtomicU64::new(0),
             all_passes: AtomicU64::new(0),
             passes: AtomicU64::new(0),
             busy_us: AtomicU64::new(0),
@@ -205,9 +212,8 @@ impl Tier {
     /// Called once per decode pass: marks the server busy (no warming or copying meanwhile) and times the passes.
     #[inline]
     pub fn note_decode(&self) {
-        self.last_decode.store(now_secs(), Ordering::Relaxed);
         self.all_passes.fetch_add(1, Ordering::Relaxed);
-        let now = self.t0.elapsed().as_micros() as u64;
+        let now = self.note_busy();
         let prev = self.last_pass_us.swap(now, Ordering::Relaxed);
         if prev > 0 && now - prev < 2_000_000 {
             self.busy_us.fetch_add(now - prev, Ordering::Relaxed);
@@ -224,10 +230,12 @@ impl Tier {
         }
     }
 
-    /// One sampled layer: how long the main GPU waited for the CPU's experts, then for the aux GPUs' (ms).
-    pub fn note_waits(&self, cpu_ms: f64, aux_ms: f64) {
-        if cpu_ms.is_finite() && aux_ms.is_finite() && cpu_ms >= 0.0 && aux_ms >= 0.0 {
-            self.waits.lock().unwrap().add(cpu_ms * 1000.0, aux_ms * 1000.0);
+    /// One sampled layer: how long the main GPU waited for the CPU's experts, then for each aux GPU in turn (ms).
+    pub fn note_waits(&self, cpu_ms: f64, aux_ms: &[f64]) {
+        let ok = |x: f64| x.is_finite() && x >= 0.0;
+        if ok(cpu_ms) && aux_ms.iter().all(|&x| ok(x)) {
+            let aux: Vec<f64> = aux_ms.iter().map(|x| x * 1000.0).collect();
+            self.waits.lock().unwrap().add(cpu_ms * 1000.0, &aux);
         }
     }
 
@@ -235,8 +243,20 @@ impl Tier {
         *self.waits.lock().unwrap()
     }
 
-    pub fn idle_for(&self) -> u64 {
-        now_secs().saturating_sub(self.last_decode.load(Ordering::Relaxed))
+    /// Marks the server busy now (a request starts or ends, a decode pass runs); returns the time in µs since `t0`.
+    pub fn note_busy(&self) -> u64 {
+        let now = self.t0.elapsed().as_micros() as u64;
+        self.last_busy_us.store(now, Ordering::Relaxed);
+        now
+    }
+
+    /// Milliseconds since the server was last busy.
+    pub fn idle_ms(&self) -> u64 {
+        (self.t0.elapsed().as_micros() as u64).saturating_sub(self.last_busy_us.load(Ordering::Relaxed)) / 1000
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.idle_ms() >= IDLE_MS
     }
 
     #[inline]
@@ -288,12 +308,14 @@ impl Tier {
 
 // ------------------------------------------------------------------------------------------------ run-time moves
 
-/// A planned move: `new` (on no GPU) replaces `victim` in GPU store `store`.
+/// A planned move: `new` replaces `victim` in GPU store `store`. With `from`, it is an exchange between two GPUs: `new`
+/// leaves store `from` and `victim` takes its slot there, so both stores stay full and no expert is on two GPUs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Move {
     pub new: (usize, usize),
     pub store: usize,
     pub victim: (usize, usize),
+    pub from: Option<usize>,
 }
 
 const SLOT_FREE: u8 = 0;
@@ -307,11 +329,12 @@ pub struct Prefetch {
     base: usize,
     cap: usize,
     state: Vec<AtomicU8>,
-    mv: Vec<Mutex<Option<(Move, [u32; 3])>>>,
+    /// the move and the byte lengths of its expert(s): `new`, then `victim` for an exchange
+    mv: Vec<Mutex<Option<(Move, [u32; 3], [u32; 3])>>>,
 }
 
 impl Prefetch {
-    /// `base`: page-locked host memory of `n * cap` bytes that outlives the process's use of it.
+    /// `base`: page-locked host memory of `n * cap` bytes that outlives the process's use of it; `cap` holds two experts.
     pub fn new(base: *mut u8, cap: usize, n: usize) -> Prefetch {
         Prefetch { base: base as usize, cap, state: (0..n).map(|_| AtomicU8::new(SLOT_FREE)).collect(), mv: (0..n).map(|_| Mutex::new(None)).collect() }
     }
@@ -320,21 +343,22 @@ impl Prefetch {
         (0..self.state.len()).find(|&i| self.state[i].compare_exchange(SLOT_FREE, SLOT_FILLING, Ordering::AcqRel, Ordering::Relaxed).is_ok())
     }
 
-    /// Copy the expert into a claimed slot and publish the move.
-    fn fill(&self, i: usize, mv: Move, parts: [&[u8]; 3]) -> bool {
+    /// Copy the expert (and, for an exchange, the victim) into a claimed slot and publish the move.
+    fn fill(&self, i: usize, mv: Move, parts: [&[u8]; 3], victim: Option<[&[u8]; 3]>) -> bool {
         let lens = parts.map(|p| p.len() as u32);
-        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let vlens = victim.map_or([0; 3], |v| v.map(|p| p.len() as u32));
+        let total: usize = lens.iter().chain(&vlens).map(|&n| n as usize).sum();
         if total > self.cap {
             self.state[i].store(SLOT_FREE, Ordering::Release);
             return false;
         }
         let dst = unsafe { std::slice::from_raw_parts_mut((self.base + i * self.cap) as *mut u8, total) };
         let mut o = 0;
-        for p in parts {
+        for p in parts.into_iter().chain(victim.into_iter().flatten()) {
             dst[o..o + p.len()].copy_from_slice(p);
             o += p.len();
         }
-        *self.mv[i].lock().unwrap() = Some((mv, lens));
+        *self.mv[i].lock().unwrap() = Some((mv, lens, vlens));
         self.state[i].store(SLOT_READY, Ordering::Release);
         true
     }
@@ -347,7 +371,7 @@ impl Prefetch {
     pub fn take(&self) -> Option<(usize, Move)> {
         for i in 0..self.state.len() {
             if self.state[i].compare_exchange(SLOT_READY, SLOT_BUSY, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                if let Some((mv, _)) = *self.mv[i].lock().unwrap() {
+                if let Some((mv, _, _)) = *self.mv[i].lock().unwrap() {
                     return Some((i, mv));
                 }
                 self.release(i);
@@ -356,12 +380,23 @@ impl Prefetch {
         None
     }
 
-    /// The expert bytes of slot `i` ([gate, up, down]).
+    /// The new expert's bytes in slot `i` ([gate, up, down]).
     pub fn parts(&self, i: usize) -> Option<[&[u8]; 3]> {
-        let (_, l) = (*self.mv[i].lock().unwrap())?;
-        let p = (self.base + i * self.cap) as *const u8;
+        let (_, l, _) = (*self.mv[i].lock().unwrap())?;
+        Some(self.at(i, 0, l))
+    }
+
+    /// For an exchange: the victim's bytes in slot `i`, which go to the store the new expert leaves.
+    pub fn victim_parts(&self, i: usize) -> Option<[&[u8]; 3]> {
+        let (mv, l, v) = (*self.mv[i].lock().unwrap())?;
+        mv.from?;
+        Some(self.at(i, l.iter().map(|&n| n as usize).sum(), v))
+    }
+
+    fn at(&self, i: usize, off: usize, l: [u32; 3]) -> [&[u8]; 3] {
+        let p = (self.base + i * self.cap + off) as *const u8;
         let (a, b, c) = (l[0] as usize, l[1] as usize, l[2] as usize);
-        unsafe { Some([std::slice::from_raw_parts(p, a), std::slice::from_raw_parts(p.add(a), b), std::slice::from_raw_parts(p.add(a + b), c)]) }
+        unsafe { [std::slice::from_raw_parts(p, a), std::slice::from_raw_parts(p.add(a), b), std::slice::from_raw_parts(p.add(a + b), c)] }
     }
 
     pub fn release(&self, i: usize) {
@@ -425,42 +460,114 @@ pub fn plan_moves(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[S
         victims.get_mut(&(st, k)).unwrap().pop();
         off.insert(i);
         off.insert(vi);
-        out.push(Move { new: (i / ne, i % ne), store: st, victim: (vi / ne, vi % ne) });
+        out.push(Move { new: (i / ne, i % ne), store: st, victim: (vi / ne, vi % ne), from: None });
     }
     out
 }
 
-/// Where a layer's time goes once the main GPU has done its own part: waiting for the CPU's experts, then for the
-/// aux GPUs'. A device that makes the main GPU wait is on the critical path; one that does not has room.
+/// Plan up to `room` exchanges that take work off GPUs finishing last (`late`, store indices) onto the main GPU (store
+/// 0): the hottest expert of a late store swaps places with a resident of the main store of the same key and at most
+/// `MOVE_RATIO` of its score. Both stores stay full; the late one keeps a colder expert. Both stores must be able to
+/// replace experts at run time.
+pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[StoreInfo], late: &[usize], busy: &[Move], room: usize) -> Vec<Move> {
+    let ne = ne.max(1);
+    if room == 0 || !stores.first().is_some_and(|s| s.swaps) {
+        return vec![];
+    }
+    let late: Vec<usize> = late.iter().copied().filter(|&i| i > 0 && stores.get(i).is_some_and(|s| s.swaps)).collect();
+    if late.is_empty() {
+        return vec![];
+    }
+    let mut off: std::collections::HashSet<usize> = busy.iter().flat_map(|m| [m.new, m.victim]).map(|(l, e)| l * ne + e).collect();
+    // main-store residents by key, coldest last
+    let mut cold: HashMap<u32, Vec<(f64, usize)>> = HashMap::new();
+    for i in 0..score.len() {
+        if loc[i] == LOC_GPU {
+            cold.entry(key[i]).or_default().push((score[i], i));
+        }
+    }
+    for v in cold.values_mut() {
+        v.sort_by(|a, b| b.0.total_cmp(&a.0));
+    }
+    let mut hot: Vec<(f64, usize, usize)> = (0..score.len())
+        .filter_map(|i| {
+            let s = loc[i].checked_sub(LOC_GPU)? as usize;
+            (late.contains(&s) && score[i] >= MOVE_MIN_SCORE).then_some((score[i], i, s))
+        })
+        .collect();
+    hot.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut out = vec![];
+    for (sc, i, src) in hot {
+        if out.len() >= room {
+            break;
+        }
+        if off.contains(&i) {
+            continue;
+        }
+        let Some(list) = cold.get_mut(&key[i]) else { continue };
+        while list.last().is_some_and(|x| off.contains(&x.1)) {
+            list.pop();
+        }
+        let Some(&(vs, vi)) = list.last() else { continue };
+        if vs > sc * MOVE_RATIO {
+            continue;
+        }
+        list.pop();
+        off.insert(i);
+        off.insert(vi);
+        out.push(Move { new: (i / ne, i % ne), store: 0, victim: (vi / ne, vi % ne), from: Some(src) });
+    }
+    out
+}
+
+/// Where a layer's time goes once the main GPU has done its own part: waiting for the CPU's experts, then for each
+/// aux GPU in turn (each wait is how much later that GPU finished than everything waited for before it). A device that
+/// makes the main GPU wait is on the critical path; one that does not has room.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Waits {
     pub cpu_us: f64,
-    pub aux_us: f64,
+    /// per aux GPU (store 1, 2, …)
+    pub aux_us: [f64; MAX_STORES],
     pub samples: u64,
 }
 
 impl Waits {
-    fn add(&mut self, cpu_us: f64, aux_us: f64) {
-        if self.samples == 0 {
-            (self.cpu_us, self.aux_us) = (cpu_us, aux_us);
-        } else {
-            self.cpu_us += (cpu_us - self.cpu_us) * WAIT_EMA;
-            self.aux_us += (aux_us - self.aux_us) * WAIT_EMA;
+    fn add(&mut self, cpu_us: f64, aux_us: &[f64]) {
+        let w = if self.samples == 0 { 1.0 } else { WAIT_EMA };
+        self.cpu_us += (cpu_us - self.cpu_us) * w;
+        for (a, &x) in self.aux_us.iter_mut().zip(aux_us) {
+            *a += (x - *a) * w;
         }
         self.samples += 1;
     }
 
+    fn ready(&self) -> bool {
+        self.samples >= WAIT_MIN_SAMPLES
+    }
+
+    /// The aux GPUs' waits together (the time the main GPU waits for aux GPUs after the CPU).
+    pub fn aux_total_us(&self) -> f64 {
+        self.aux_us.iter().sum()
+    }
+
     /// Which stores may take more experts from the CPU (store 0 = main GPU, then the aux GPUs). Moving a hot expert from
     /// the CPU onto a GPU only shortens a layer while the CPU is what the main GPU waits for, and only onto a GPU that is
-    /// not itself the last to finish: the main GPU while the CPU makes it wait, an aux GPU while it finishes before the
-    /// CPU. Before enough samples every store is open.
+    /// not itself late: the main GPU while the CPU makes it wait, an aux GPU while it does not finish after the CPU. Before
+    /// enough samples every store is open.
     pub fn open(&self, stores: usize) -> Vec<bool> {
-        if self.samples < WAIT_MIN_SAMPLES {
+        if !self.ready() {
             return vec![true; stores];
         }
         let cpu_slow = self.cpu_us > WAIT_US;
-        let aux_free = self.aux_us <= WAIT_US;
-        (0..stores).map(|i| cpu_slow && (i == 0 || aux_free)).collect()
+        (0..stores).map(|i| cpu_slow && (i == 0 || self.aux_us.get(i - 1).is_some_and(|&a| a <= WAIT_US))).collect()
+    }
+
+    /// Aux GPUs (store indices) that finish after the CPU and everything before them: work should leave them.
+    pub fn late(&self, stores: usize) -> Vec<usize> {
+        if !self.ready() {
+            return vec![];
+        }
+        (1..stores).filter(|&i| self.aux_us.get(i - 1).is_some_and(|&a| a > WAIT_US)).collect()
     }
 }
 
@@ -508,11 +615,6 @@ pub struct Saved {
 impl Saved {
     pub fn new(n: usize) -> Saved {
         Saved { learned: Learned::new(n), devices: Default::default(), configs: Default::default() }
-    }
-
-    /// A GPU's measured cost per expert pick (µs), when known.
-    pub fn expert_us(&self, uuid: &str) -> Option<f64> {
-        self.devices.get(uuid)?.get("expert_us")?.as_f64().filter(|v| *v > 0.0)
     }
 
     /// Drop devices unseen for `DEVICE_KEEP_SECS` and all but the `MAX_CONFIGS` most recent combinations.
@@ -699,13 +801,6 @@ pub fn blend_rank(base: &[(usize, usize, u64)], learned: &Learned, nl: usize, ne
         score(j).total_cmp(&score(i)).then(pos.get(x).unwrap_or(&usize::MAX).cmp(pos.get(y).unwrap_or(&usize::MAX)))
     });
     keys
-}
-
-/// Relative cost per expert pick of each store (fastest = 1) when every store has a measurement, for placement.
-pub fn store_costs(saved: &Saved, uuids: &[String]) -> Option<Vec<f64>> {
-    let us: Vec<f64> = uuids.iter().map(|u| saved.expert_us(u)).collect::<Option<_>>()?;
-    let min = us.iter().copied().fold(f64::INFINITY, f64::min);
-    (min > 0.0 && min.is_finite()).then(|| us.iter().map(|u| u / min).collect())
 }
 
 // ------------------------------------------------------------------------------------------------ storage facts
@@ -1012,7 +1107,6 @@ impl Background {
     /// Fold this run's measurements into the device and combination records.
     fn measure(&mut self) {
         let now = now_secs();
-        let nl = self.tier.nl.max(1) as f64;
         let passes = self.tier.passes.load(Ordering::Relaxed);
         let all = self.tier.all_passes.load(Ordering::Relaxed);
         if let Some(stores) = self.tier.stores.get() {
@@ -1020,21 +1114,18 @@ impl Background {
             for (i, s) in stores.iter().enumerate() {
                 let picks = self.tier.store_picks[i.min(MAX_STORES - 1)].load(Ordering::Relaxed) as f64;
                 let mut d = self.saved.devices.get(&s.uuid).and_then(|v| v.as_object().cloned()).unwrap_or_default();
+                d.remove("expert_us"); // per-pick cost of an earlier build: a layer's fixed cost made it meaningless
                 d.insert("name".into(), s.name.clone().into());
                 d.insert("link_gbs".into(), ((s.link_gbs * 10.0).round() / 10.0).into());
                 d.insert("seen".into(), now.into());
-                let per_layer = if all > 0 { picks / all as f64 / nl } else { 0.0 };
                 if let Some(&(sum, n)) = ms.get(i)
                     && n >= 8
-                    && per_layer >= 0.05
                 {
-                    let us = sum / n as f64 * 1000.0 / per_layer;
-                    // smooth across runs: the new run weighs like its sample count, at most 3/4
-                    let w = (n as f64 / 64.0).min(0.75);
-                    let old = d.get("expert_us").and_then(|v| v.as_f64()).filter(|v| *v > 0.0);
-                    let v = old.map_or(us, |o| o * (1.0 - w) + us * w);
-                    d.insert("expert_us".into(), ((v * 10.0).round() / 10.0).into());
-                    d.insert("samples".into(), (d.get("samples").and_then(|x| x.as_u64()).unwrap_or(0) + n).into());
+                    // the GPU's expert kernels in one (sampled) layer of a decode token, ms
+                    d.insert("expert_layer_ms".into(), (((sum / n as f64) * 1000.0).round() / 1000.0).into());
+                }
+                if all > 0 {
+                    d.insert("picks_per_token".into(), ((picks / all as f64 * 10.0).round() / 10.0).into());
                 }
                 self.saved.devices.insert(s.uuid.clone(), serde_json::Value::Object(d));
             }
@@ -1052,9 +1143,10 @@ impl Background {
             }
             c.insert("share_from_file".into(), (((h[3] as f64 / tot) * 1000.0).round() / 1000.0).into());
             let w = self.tier.waits();
-            if w.samples >= WAIT_MIN_SAMPLES {
+            if w.ready() {
+                let n = self.tier.stores.get().map_or(0, |s| s.len().saturating_sub(1));
                 c.insert("wait_for_cpu_us".into(), w.cpu_us.round().into());
-                c.insert("wait_for_aux_us".into(), w.aux_us.round().into());
+                c.insert("wait_for_aux_us".into(), w.aux_us[..n.min(MAX_STORES)].iter().map(|x| x.round()).collect::<Vec<_>>().into());
             }
             let cpu = h[1] + h[2] + h[3];
             if all > 0 {
@@ -1079,7 +1171,7 @@ impl Background {
             "file_side_experts": (0..self.tier.nl * ne).filter(|&i| self.tier.loc(i) == LOC_FILE).count(),
             "moves_planned": st.moves_planned,
             "wait_for_cpu_us": self.tier.waits().cpu_us.round(),
-            "wait_for_aux_us": self.tier.waits().aux_us.round(),
+            "wait_for_aux_us": self.tier.waits().aux_total_us().round(),
             "wait_samples": self.tier.waits().samples,
             "page_cache_warm_gb": (st.warm_bytes as f64 / 1e9 * 10.0).round() / 10.0,
             "model_read_mb_s": self.model_read_mb_s.map(f64::round).or(rate(st.warm_bytes, st.warm_secs)),
@@ -1094,7 +1186,7 @@ impl Background {
     /// Plan and prefetch run-time moves into free slots. Returns the number planned.
     pub fn prefetch_moves(&self, m: &dyn ExpertBytes) -> usize {
         let (Some(pf), Some(stores), Some(key)) = (self.tier.prefetch.get(), self.tier.stores.get(), self.tier.key.get()) else { return 0 };
-        if !stores.iter().any(|s| s.tier_swaps) {
+        if !stores.iter().any(|s| s.tier_swaps || s.swaps) {
             return 0;
         }
         let free = pf.state.iter().filter(|s| s.load(Ordering::Relaxed) == SLOT_FREE).count();
@@ -1103,15 +1195,21 @@ impl Background {
         }
         let ne = self.tier.ne;
         let loc: Vec<u8> = (0..self.tier.nl * ne).map(|i| self.tier.loc(i)).collect();
-        let busy = pf.in_transit();
-        let open = self.tier.waits().open(stores.len());
-        let moves = plan_moves(ne, &self.saved.learned.score, &loc, key, stores, &open, &busy, free);
+        let mut busy = pf.in_transit();
+        let w = self.tier.waits();
+        let score = &self.saved.learned.score;
+        // work off GPUs that finish last first, then off the CPU onto GPUs with room
+        let mut moves = plan_exchanges(ne, score, &loc, key, stores, &w.late(stores.len()), &busy, free);
+        busy.extend(moves.iter().copied());
+        if stores.iter().any(|s| s.tier_swaps) {
+            let more = plan_moves(ne, score, &loc, key, stores, &w.open(stores.len()), &busy, free - moves.len());
+            moves.extend(more);
+        }
         let mut n = 0;
         for mv in moves {
             let Some(i) = pf.claim() else { break };
-            let (l, e) = mv.new;
-            let parts = self.tier.ssd_get(l, e).unwrap_or_else(|| m.parts(l, e));
-            if pf.fill(i, mv, parts) {
+            let bytes = |(l, e): (usize, usize)| self.tier.ssd_get(l, e).unwrap_or_else(|| m.parts(l, e));
+            if pf.fill(i, mv, bytes(mv.new), mv.from.map(|_| bytes(mv.victim))) {
                 n += 1;
             } else {
                 pf.unclaim(i);
@@ -1133,7 +1231,7 @@ impl Background {
             if warmed.contains(&(l, e)) {
                 continue;
             }
-            if self.tier.idle_for() < IDLE_SECS {
+            if !self.tier.is_idle() {
                 break; // a request arrived: stop at once
             }
             let p = match self.tier.ssd_get(l, e) {
@@ -1151,7 +1249,7 @@ impl Background {
             let t = std::time::Instant::now();
             let mut copied = 0u64;
             for &(l, e) in &order {
-                if copied >= STEP_BYTES || self.tier.idle_for() < IDLE_SECS {
+                if copied >= STEP_BYTES || !self.tier.is_idle() {
                     break;
                 }
                 let i = l * self.tier.ne + e;
@@ -1185,17 +1283,16 @@ impl Background {
         save(&self.state, &self.id, &self.files, self.tier.nl, self.tier.ne, &self.saved, stats).is_ok()
     }
 
-    /// The loop: prefetch run-time moves every second, fold usage every 10 s, work and save while idle.
+    /// The loop, every 200 ms: prefetch run-time moves; every 10 s fold usage; while idle (a 2 s pause) warm the page
+    /// cache and extend the SSD buffer; every 2 min save (busy or not), every 10 min log the figures.
     pub fn run(mut self, m: &'static dyn ExpertBytes) {
         let mut last = self.tier.snapshot_picks();
         let mut st = Stats::default();
         let mut warmed = std::collections::HashSet::new();
-        let mut last_save = std::time::Instant::now();
-        let mut last_fold = std::time::Instant::now();
+        let (mut last_save, mut last_fold, mut last_report) = (std::time::Instant::now(), std::time::Instant::now(), std::time::Instant::now());
         let mut dirty = false;
-        let mut last_report = std::time::Instant::now();
         while !self.tier.stop.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
             if last_fold.elapsed().as_secs() >= FOLD_EVERY_SECS {
                 last_fold = std::time::Instant::now();
                 let now = self.tier.snapshot_picks();
@@ -1207,10 +1304,9 @@ impl Background {
                 }
             }
             st.moves_planned += self.prefetch_moves(m) as u64;
-            if self.tier.idle_for() < IDLE_SECS {
-                continue;
+            if self.tier.is_idle() {
+                self.idle_step(m, &mut st, &mut warmed);
             }
-            self.idle_step(m, &mut st, &mut warmed);
             if dirty && last_save.elapsed().as_secs() >= SAVE_EVERY_SECS {
                 if self.save_now(&st) {
                     st.saves += 1;
@@ -1218,7 +1314,7 @@ impl Background {
                 last_save = std::time::Instant::now();
                 dirty = false;
             }
-            if last_report.elapsed().as_secs() >= 600 {
+            if last_report.elapsed().as_secs() >= REPORT_EVERY_SECS {
                 eprintln!("tier: {}", self.stats_json(&st));
                 last_report = std::time::Instant::now();
             }
@@ -1379,15 +1475,15 @@ mod tests {
         assert_eq!(t.hits()[0], 2);
         assert_eq!(t.store_picks[1].load(Ordering::Relaxed), 1);
         t.note_decode();
-        assert!(t.idle_for() <= 1);
+        assert!(t.idle_ms() < 1000 && !t.is_idle());
     }
 
     #[test]
     fn plan_moves_hot_off_gpu_against_clearly_colder_same_key_residents() {
         // 1 layer x 8 experts; store 0 swaps by tiering, store 1 is adaptive (left alone)
         let stores = vec![
-            StoreInfo { uuid: "GPU-a".into(), name: "a".into(), link_gbs: 3.0, tier_swaps: true },
-            StoreInfo { uuid: "GPU-b".into(), name: "b".into(), link_gbs: 24.0, tier_swaps: false },
+            StoreInfo { uuid: "GPU-a".into(), name: "a".into(), link_gbs: 3.0, tier_swaps: true, swaps: true },
+            StoreInfo { uuid: "GPU-b".into(), name: "b".into(), link_gbs: 24.0, tier_swaps: false, swaps: true },
         ];
         let loc = [LOC_GPU, LOC_GPU, LOC_GPU + 1, LOC_FILE, LOC_ARENA, LOC_FILE, LOC_FILE, LOC_GPU];
         let key = [1, 1, 1, 1, 1, 2, 1, 1];
@@ -1395,7 +1491,7 @@ mod tests {
         let m = plan_moves(8, &score, &loc, &key, &stores, &[true, true], &[], 4);
         // 50 replaces the coldest tier store resident (5), 30 the next (20 > 15: no), 999 has no same-key victim,
         // 3 is below the minimum, store 1's resident (1) is not a tiering victim
-        assert_eq!(m, vec![Move { new: (0, 3), store: 0, victim: (0, 0) }]);
+        assert_eq!(m, vec![Move { new: (0, 3), store: 0, victim: (0, 0), from: None }]);
         // a move in transit blocks both experts
         let m2 = plan_moves(8, &score, &loc, &key, &stores, &[true, true], &m, 4);
         assert!(m2.iter().all(|x| x.new != (0, 3) && x.victim != (0, 0)));
@@ -1404,36 +1500,63 @@ mod tests {
     }
 
     #[test]
-    fn waits_decide_which_gpu_may_take_cpu_work() {
+    fn waits_decide_which_gpu_may_take_cpu_work_and_which_is_late() {
         let mut w = Waits::default();
         assert_eq!(w.open(2), vec![true, true], "unmeasured: open");
+        assert!(w.late(2).is_empty(), "unmeasured: nothing late");
         for _ in 0..WAIT_MIN_SAMPLES {
-            w.add(300.0, 0.0); // the main GPU waits for the CPU; the aux GPU is done before it
+            w.add(300.0, &[0.0]); // the main GPU waits for the CPU; the aux GPU is done before it
         }
         assert_eq!(w.open(2), vec![true, true]);
+        assert!(w.late(2).is_empty());
         let mut a = w;
         for _ in 0..200 {
-            a.add(300.0, 150.0); // the aux GPU finishes last: it takes no more
+            a.add(115.0, &[90.0]); // the station on 11.11.: the aux GPU finishes last
         }
         assert_eq!(a.open(2), vec![true, false]);
+        assert_eq!(a.late(2), vec![1]);
         let mut c = w;
         for _ in 0..200 {
-            c.add(0.0, 0.0); // the CPU is never waited for: no move helps
+            c.add(0.0, &[0.0]); // nobody is waited for: no move helps
         }
         assert_eq!(c.open(2), vec![false, false]);
+        // three GPUs: only the second aux GPU is late
+        let mut t3 = Waits::default();
+        for _ in 0..WAIT_MIN_SAMPLES {
+            t3.add(50.0, &[0.0, 70.0]);
+        }
+        assert_eq!(t3.late(3), vec![2]);
+        assert_eq!(t3.open(3), vec![true, true, false]);
         let t = Tier::new(1, 1);
-        t.note_waits(0.3, 0.0);
+        t.note_waits(0.3, &[0.09]);
         assert_eq!(t.waits().samples, 1);
-        assert!((t.waits().cpu_us - 300.0).abs() < 1e-9);
+        assert!((t.waits().cpu_us - 300.0).abs() < 1e-9 && (t.waits().aux_us[0] - 90.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exchanges_take_hot_experts_off_late_gpus_onto_the_main_one() {
+        let st = |swaps| StoreInfo { uuid: "u".into(), name: "n".into(), link_gbs: 1.0, tier_swaps: false, swaps };
+        let stores = vec![st(true), st(true)];
+        // 1 layer x 8: main holds 0 (cold), 1 (warm); aux holds 2 (hot), 3 (hotter), 4 (other key); 5 on the CPU
+        let loc = [LOC_GPU, LOC_GPU, LOC_GPU + 1, LOC_GPU + 1, LOC_GPU + 1, LOC_ARENA, LOC_FILE, LOC_FILE];
+        let key = [1, 1, 1, 1, 2, 1, 1, 1];
+        let score = [2.0, 40.0, 50.0, 90.0, 500.0, 70.0, 0.0, 0.0];
+        let m = plan_exchanges(8, &score, &loc, &key, &stores, &[1], &[], 4);
+        // 90 swaps with the coldest main resident (2); 50 would need one at most 25: 40 is too warm
+        assert_eq!(m, vec![Move { new: (0, 3), store: 0, victim: (0, 0), from: Some(1) }]);
+        assert!(plan_exchanges(8, &score, &loc, &key, &stores, &[], &[], 4).is_empty(), "nothing late");
+        assert!(plan_exchanges(8, &score, &loc, &key, &[st(false), st(true)], &[1], &[], 4).is_empty(), "main cannot swap");
+        assert!(plan_exchanges(8, &score, &loc, &key, &stores, &[1], &m, 4).is_empty(), "in transit");
     }
 
     #[test]
     fn prefetch_slots_fill_take_release() {
-        let mut mem = vec![0u8; 2 * 64];
-        let pf = Prefetch::new(mem.as_mut_ptr(), 64, 2);
-        let mv = Move { new: (0, 1), store: 0, victim: (0, 2) };
+        let mut mem = vec![0u8; 2 * 128];
+        let pf = Prefetch::new(mem.as_mut_ptr(), 128, 2);
+        let mv = Move { new: (0, 1), store: 0, victim: (0, 2), from: None };
         let i = pf.claim().unwrap();
-        assert!(pf.fill(i, mv, [&[1u8; 10], &[2u8; 20], &[3u8; 30]]));
+        assert!(pf.fill(i, mv, [&[1u8; 10], &[2u8; 20], &[3u8; 30]], None));
+        assert!(pf.victim_parts(i).is_none());
         assert_eq!(pf.in_transit(), vec![mv]);
         let (j, got) = pf.take().unwrap();
         assert_eq!((j, got), (i, mv));
@@ -1443,17 +1566,16 @@ mod tests {
         pf.release(j);
         assert!(pf.in_transit().is_empty());
         let k = pf.claim().unwrap();
-        assert!(!pf.fill(k, mv, [&[0u8; 40], &[0u8; 20], &[0u8; 10]]), "larger than a slot");
+        assert!(!pf.fill(k, mv, [&[0u8; 100], &[0u8; 20], &[0u8; 10]], None), "larger than a slot");
+        // an exchange carries both experts
+        let x = Move { new: (0, 3), store: 0, victim: (0, 4), from: Some(1) };
+        let k = pf.claim().unwrap();
+        assert!(pf.fill(k, x, [&[7u8; 5], &[7u8; 5], &[7u8; 5]], Some([&[9u8; 4], &[9u8; 4], &[9u8; 4]])));
+        let (j, _) = pf.take().unwrap();
+        let v = pf.victim_parts(j).unwrap();
+        assert_eq!((v[0].len(), v[2][3]), (4, 9));
+        assert_eq!(pf.parts(j).unwrap()[0][0], 7);
         drop(mem);
-    }
-
-    #[test]
-    fn store_costs_need_all_measured() {
-        let mut s = Saved::new(1);
-        s.devices.insert("a".into(), serde_json::json!({"expert_us": 40.0}));
-        s.devices.insert("b".into(), serde_json::json!({"expert_us": 60.0}));
-        assert_eq!(store_costs(&s, &["a".into(), "b".into()]), Some(vec![1.0, 1.5]));
-        assert_eq!(store_costs(&s, &["a".into(), "c".into()]), None);
     }
 
     struct Fake(Vec<Vec<u8>>);
@@ -1500,7 +1622,7 @@ mod tests {
             tier.set_loc(l, e, LOC_FILE);
         }
         tier.set_loc(0, 0, LOC_GPU);
-        tier.set_stores(vec![StoreInfo { uuid: "GPU-x".into(), name: "X".into(), link_gbs: 24.6, tier_swaps: true }]);
+        tier.set_stores(vec![StoreInfo { uuid: "GPU-x".into(), name: "X".into(), link_gbs: 24.6, tier_swaps: true, swaps: true }]);
         let fake = Fake((0..8).map(|i| vec![i as u8; 4300]).collect());
         let mut saved = Saved::new(8);
         saved.learned.score[1 * 4 + 2] = 9.0;
@@ -1514,6 +1636,9 @@ mod tests {
         let mut st = Stats::default();
         let mut warmed = std::collections::HashSet::new();
         if ram_headroom() > 0 {
+            tier.last_busy_us.store(0, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(IDLE_MS + 50));
+            assert!(tier.is_idle());
             let moved = bg.idle_step(&fake, &mut st, &mut warmed);
             assert_eq!(moved, 3 * 4300);
             assert!(warmed.contains(&(1, 2)));
@@ -1524,11 +1649,14 @@ mod tests {
         tier.passes.store(200, Ordering::Relaxed);
         tier.all_passes.store(200, Ordering::Relaxed);
         tier.busy_us.store(10_000_000, Ordering::Relaxed);
-        tier.store_picks[0].store(200 * 2 * 3, Ordering::Relaxed); // 3 picks per layer
+        tier.store_picks[0].store(200 * 2 * 3, Ordering::Relaxed); // 3 picks per layer, 2 layers
+        bg.saved.devices.insert("GPU-x".into(), serde_json::json!({"expert_us": 99.0}));
         bg.measure();
         let d = &bg.saved.devices["GPU-x"];
         assert_eq!(d["name"], "X");
-        assert!((d["expert_us"].as_f64().unwrap() - 166.7).abs() < 0.2, "{d}"); // 0.5 ms / 3 picks
+        assert_eq!(d["expert_layer_ms"], 0.5);
+        assert_eq!(d["picks_per_token"], 6.0);
+        assert!(d.get("expert_us").is_none(), "the old per-pick cost is dropped");
         assert_eq!(bg.saved.devices["disk:8:0"]["read_mb_s"], 180.0);
         assert_eq!(bg.saved.configs["GPU-x"]["decode_tok_s"], 20.0);
         let j = bg.stats_json(&st);

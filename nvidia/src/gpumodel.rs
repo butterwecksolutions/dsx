@@ -182,7 +182,7 @@ pub struct GpuModel<'m> {
     tier_sample: Option<usize>,
     tev0: Option<[crate::gpu::Event; 2]>,
     /// the main GPU's waits in the sampled layer: before the CPU's experts, after them, after the aux GPUs'
-    twait: Option<[crate::gpu::Event; 3]>,
+    twait: Option<Vec<crate::gpu::Event>>,
     /// one-token Q8_0 GEMVs on gemv_q8r1 (DSX_Q8R1=0: gemv_q8r, for A/Bs)
     q8r1: bool,
     /// one-token split-k GEMVs on the *_sk1 kernels (DSX_SK1=0: the generic ones, for A/Bs)
@@ -665,17 +665,11 @@ impl<'m> GpuModel<'m> {
         // static stores take the hottest experts first; the adaptive ones (the main GPU, fast-linked aux GPUs) the next
         let caps: Vec<usize> = std::iter::once(gpu0_bytes).chain(aux_g.iter().map(|a| a.1)).collect();
         let group: Vec<u8> = std::iter::once(1).chain(aux_g.iter().map(|a| a.2 as u8)).collect();
-        // GPUs by UUID (stable across CUDA_VISIBLE_DEVICES): with an expert cost measured for each in earlier runs, the
-        // hottest experts go preferably to the faster ones
+        // GPUs by UUID (stable across CUDA_VISIBLE_DEVICES orders): tiering keeps its measurements per GPU
         let uuids: Vec<String> = std::iter::once(crate::gpu::uuid(ordinal)).chain(aux_g.iter().map(|a| crate::gpu::uuid(a.0.ordinal))).collect();
-        gm.g.bind();
-        let costs = if caps.len() > 1 { crate::tier::store_costs(&saved, &uuids) } else { None };
-        if let Some(cs) = &costs {
-            eprintln!("tier: measured expert cost per GPU (fastest = 1): {}", cs.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(", "));
-        }
         let mut tier_stores: Vec<crate::tier::StoreInfo> = vec![];
         if caps.iter().any(|&b| b > 0) {
-            let sets = crate::experts::place(m, rank.as_deref(), &caps, &group, costs.as_deref());
+            let sets = crate::experts::place(m, rank.as_deref(), &caps, &group);
             // staging for in-flight replacements: the largest expert's raw bytes
             let max_raw = (0..c.n_layers)
                 .flat_map(|l| (0..c.n_experts).map(move |e| (l, e)))
@@ -697,11 +691,12 @@ impl<'m> GpuModel<'m> {
                     name: gm.g.name.clone(),
                     link_gbs: probe.iter().find(|p| p.ordinal == ordinal).map_or(0.0, |p| p.h2d_gbs),
                     tier_swaps: tier_moves,
+                    swaps: s0.swap_room() > 0,
                 });
                 gm.exp0 = Some(s0);
             } else {
                 // store 0 is always the main GPU's (tier.rs locations count stores from it)
-                tier_stores.push(crate::tier::StoreInfo { uuid: uuids[0].clone(), name: gm.g.name.clone(), link_gbs: 0.0, tier_swaps: false });
+                tier_stores.push(crate::tier::StoreInfo { uuid: uuids[0].clone(), name: gm.g.name.clone(), link_gbs: 0.0, tier_swaps: false, swaps: false });
             }
             let mut msg = format!("experts resident: GPU{ordinal} {} ({:.1} GB{})", sets[0].len(), gm.exp0.as_ref().map_or(0, |x| x.bytes) as f64 / 1e9,
                                   if tier_stores[0].tier_swaps { ", tier moves" } else { "" });
@@ -720,7 +715,7 @@ impl<'m> GpuModel<'m> {
                 if tier_moves {
                     exp.enable_swaps(&ga, 1, max_raw)?;
                 }
-                tier_stores.push(crate::tier::StoreInfo { uuid: crate::gpu::uuid(ga.ordinal), name: ga.name.clone(), link_gbs: bw, tier_swaps: tier_moves });
+                tier_stores.push(crate::tier::StoreInfo { uuid: crate::gpu::uuid(ga.ordinal), name: ga.name.clone(), link_gbs: bw, tier_swaps: tier_moves, swaps: exp.swap_room() > 0 });
                 let pre = if pl.prefill_chunk > 0 { Some(prefill::AuxPrefill::new(&ga, m, pl.prefill_chunk, stream, bw)?) } else { None };
                 msg += &format!(", GPU{} {} ({:.1} GB, {}{}, {bw:.1} GB/s link)", ga.ordinal, set.len(), exp.bytes as f64 / 1e9,
                                 if adaptive { "adaptive" } else if tier_moves { "static, tier moves" } else { "static" }, if stream { ", streams prefill experts" } else { "" });
@@ -813,13 +808,15 @@ impl<'m> GpuModel<'m> {
                         [x.gate.bytes().len() as u32, x.up.bytes().len() as u32, x.down.bytes().len() as u32]
                     })
                     .collect();
-                if tier_stores.iter().any(|s| s.tier_swaps) {
-                    // pinned slots for the experts on their way to a GPU (the background thread fills them)
+                // moves from the CPU need a fixed-set store; exchanges between GPUs need two stores that can swap
+                if tier_stores.iter().any(|s| s.tier_swaps) || tier_stores.iter().filter(|s| s.swaps).count() >= 2 {
+                    // pinned slots for the experts on their way to a GPU (the background thread fills them); an exchange
+                    // carries two experts
                     let max_raw = lens.iter().map(|l| l.iter().map(|&n| n as usize).sum::<usize>()).max().unwrap_or(0);
-                    match crate::gpu::HostBuf::new(crate::tier::PREFETCH_SLOTS * max_raw) {
+                    match crate::gpu::HostBuf::new(crate::tier::PREFETCH_SLOTS * 2 * max_raw) {
                         Ok(b) => {
                             let b: &'static crate::gpu::HostBuf = Box::leak(Box::new(b));
-                            tier.set_prefetch(crate::tier::Prefetch::new(b.host_ptr(), max_raw, crate::tier::PREFETCH_SLOTS));
+                            tier.set_prefetch(crate::tier::Prefetch::new(b.host_ptr(), 2 * max_raw, crate::tier::PREFETCH_SLOTS));
                             gm.tier_swap = true;
                         }
                         Err(e) => eprintln!("tier: no prefetch buffer ({e}): GPU sets stay as placed"),
@@ -830,7 +827,8 @@ impl<'m> GpuModel<'m> {
                 if gm.exp0.is_some() {
                     gm.tev0 = Some([gm.g.timed_event()?, gm.g.timed_event()?]);
                 }
-                gm.twait = Some([gm.g.timed_event()?, gm.g.timed_event()?, gm.g.timed_event()?]);
+                // before the CPU wait, after it, after each aux GPU's wait
+                gm.twait = Some((0..2 + gm.aux.len()).map(|_| gm.g.timed_event()).collect::<Result<Vec<_>>>()?);
                 for a in gm.aux.iter_mut() {
                     a.tev = Some([a.g.timed_event()?, a.g.timed_event()?]);
                 }
@@ -1005,9 +1003,9 @@ impl<'m> GpuModel<'m> {
         self.gemv_t(&l.sh_down, hm, a, t)?;
         self.ev(li, 4)?;
         // tiering: in the sampled layer, time the main GPU's waits for the CPU's experts and then the aux GPUs'
-        let waits = if t == 1 && self.tier_sample == Some(li) { self.twait } else { None };
-        if let Some([w0, _, _]) = waits {
-            self.g.record(w0, false)?;
+        let waits = if t == 1 && self.tier_sample == Some(li) { self.twait.clone() } else { None };
+        if let Some(w) = &waits {
+            self.g.record(w[0], false)?;
         }
         // the CPU's experts: this layer's (or, deferred, the previous layer's; the last layer waits for its own too)
         let last = li + 1 == c.n_layers;
@@ -1049,14 +1047,14 @@ impl<'m> GpuModel<'m> {
             }
         }
         self.ev(li, 5)?;
-        if let Some([_, w1, _]) = waits {
-            self.g.record(w1, false)?;
+        if let Some(w) = &waits {
+            self.g.record(w[1], false)?;
         }
         for i in 0..self.aux.len() {
             self.flag_wait(d0 + crate::handoff::aux_flag(i) as u64, seq)?;
-        }
-        if let Some([_, _, w2]) = waits {
-            self.g.record(w2, false)?;
+            if let Some(w) = &waits {
+                self.g.record(w[2 + i], false)?;
+            }
         }
         self.ev(li, 6)?;
         if fuse {
@@ -1204,8 +1202,11 @@ impl<'m> GpuModel<'m> {
                 t.set_loc(l, e, crate::tier::LOC_GPU + st as u8);
                 if let Some(k) = self.tier_moves.iter().position(|m| m.0 == (l, e)) {
                     let (_, slot) = self.tier_moves.swap_remove(k);
-                    if let Some(pf) = t.prefetch() {
-                        pf.release(slot);
+                    // an exchange has two copies in flight: the slot is free once both landed
+                    if !self.tier_moves.iter().any(|m| m.1 == slot) {
+                        if let Some(pf) = t.prefetch() {
+                            pf.release(slot);
+                        }
                     }
                 }
             }
@@ -1214,42 +1215,93 @@ impl<'m> GpuModel<'m> {
         Ok(())
     }
 
-    /// Between tokens: start at most one of tiering's planned moves (an expert on no GPU into a fixed-set store, in
-    /// place of a clearly colder resident of the same types). The plan is checked against the current state; a stale
-    /// one is dropped. Same protocol as adapt_step: the victim leaves the table now and the CPU computes it from the
-    /// next token on; the new expert becomes resident at commit, after its copy completed.
-    fn tier_step(&mut self) -> Result<()> {
-        let (Some(t), Some(w)) = (crate::tier::global(), self.worker.as_ref()) else { return Ok(()) };
-        let Some(pf) = t.prefetch() else { return Ok(()) };
-        let Some((slot, mv)) = pf.take() else { return Ok(()) };
+    /// Between tokens: start at most one of tiering's planned moves, checked against the current state (a stale plan is
+    /// dropped). Same protocol as adapt_step: a victim leaves its store's table now and the CPU computes it from the next
+    /// token on; the new expert enters a table only at commit, after its copy completed.
+    /// * A move from the CPU: the new expert (on no GPU) replaces a colder resident of a fixed-set store.
+    /// * An exchange: the new expert leaves a late aux GPU for the main GPU and the main GPU's colder victim takes its
+    ///   slot there. Both leave their tables before either copy starts, so no expert is ever resident on two GPUs; until
+    ///   their copies land, the CPU computes both.
+    fn tier_step(&mut self) -> Result<bool> {
+        let (Some(t), Some(w)) = (crate::tier::global(), self.worker.as_ref()) else { return Ok(false) };
+        let Some(pf) = t.prefetch() else { return Ok(false) };
+        let Some((slot, mv)) = pf.take() else { return Ok(false) };
         let m = self.m;
         let ne = m.cfg.n_experts;
         let ((l, e), (vl, ve)) = (mv.new, mv.victim);
-        let x = &m.layers[l].experts[e];
+        let (x, v) = (&m.layers[l].experts[e], &m.layers[vl].experts[ve]);
         let types = (x.gate.ty, x.down.ty);
+        let fits = |raw: [&[u8]; 3], x: &crate::model::Expert| raw[0].len() == x.gate.bytes().len() && raw[1].len() == x.up.bytes().len() && raw[2].len() == x.down.bytes().len();
         let busy = self.exp0.iter().flat_map(|s| s.pending()).chain(self.aux.iter().flat_map(|a| a.exp.pending())).any(|p| p == (l, e) || p == (vl, ve));
-        let free = !busy && !self.resident(l, e) && w.on_cpu[l * ne + e].load(std::sync::atomic::Ordering::Relaxed);
-        let arena_has = self.arena.is_some_and(|a| a.get(vl, ve).is_some());
-        let target: Option<(&Gpu, &mut crate::experts::GpuExperts)> = match mv.store {
-            0 if self.adapt == 0 => self.exp0.as_mut().map(|s| (&self.g, s)),
-            i => self.aux.get_mut(i.wrapping_sub(1)).filter(|a| !a.adaptive).map(|a| (&a.g, &mut a.exp)),
-        };
+        let side = |(l, e): (usize, usize)| if self.arena.is_some_and(|a| a.get(l, e).is_some()) { crate::tier::LOC_ARENA } else { crate::tier::LOC_FILE };
+        let (loc_new, loc_victim) = (side((l, e)), side((vl, ve)));
         let mut started = false;
-        if let (true, Some((g, s)), Some(raw)) = (free, target, pf.parts(slot)) {
-            if s.has(vl, ve) && s.swap_room() > 0 && s.types(vl, ve) == Some(types) && raw[0].len() == x.gate.bytes().len() {
-                started = s.begin_swap(g, (vl, ve), (l, e), raw)?;
+        match mv.from {
+            None => {
+                let free = !busy && !self.resident(l, e) && w.on_cpu[l * ne + e].load(std::sync::atomic::Ordering::Relaxed);
+                let target: Option<(&Gpu, &mut crate::experts::GpuExperts)> = match mv.store {
+                    0 if self.adapt == 0 => self.exp0.as_mut().map(|s| (&self.g, s)),
+                    i => self.aux.get_mut(i.wrapping_sub(1)).filter(|a| !a.adaptive).map(|a| (&a.g, &mut a.exp)),
+                };
+                if let (true, Some((g, s)), Some(raw)) = (free, target, pf.parts(slot)) {
+                    if s.has(vl, ve) && s.swap_room() > 0 && s.types(vl, ve) == Some(types) && fits(raw, x) {
+                        started = s.begin_swap(g, (vl, ve), (l, e), raw)?;
+                    }
+                }
+                if started {
+                    self.adapt_flags.push((vl * ne + ve, true));
+                    t.set_loc(vl, ve, loc_victim);
+                    self.tier_moves.push(((l, e), slot));
+                }
+            }
+            Some(src) => {
+                let (s0, a) = (self.exp0.as_mut(), self.aux.get_mut(src.wrapping_sub(1)));
+                if let (false, 0, Some(s0), Some(a), Some(raw), Some(vraw)) = (busy, mv.store, s0, a, pf.parts(slot), pf.victim_parts(slot)) {
+                    let ready = a.exp.has(l, e) && s0.has(vl, ve) && a.exp.swap_room() > 0 && s0.swap_room() > 0
+                        && a.exp.types(l, e) == Some(types) && s0.types(vl, ve) == Some(types) && fits(raw, x) && fits(vraw, v);
+                    if ready {
+                        // both checks passed on this thread: the second begin_swap cannot be refused
+                        started = s0.begin_swap(&self.g, (vl, ve), (l, e), raw)?;
+                        if started {
+                            anyhow::ensure!(a.exp.begin_swap(&a.g, (l, e), (vl, ve), vraw)?, "tier: exchange could not start its second half");
+                        }
+                    }
+                }
+                if started {
+                    self.adapt_flags.push((vl * ne + ve, true));
+                    self.adapt_flags.push((l * ne + e, true));
+                    t.set_loc(vl, ve, loc_victim);
+                    t.set_loc(l, e, loc_new);
+                    self.tier_moves.push(((l, e), slot));
+                    self.tier_moves.push(((vl, ve), slot));
+                }
             }
         }
         if started {
-            self.adapt_flags.push((vl * ne + ve, true));
-            t.set_loc(vl, ve, if arena_has { crate::tier::LOC_ARENA } else { crate::tier::LOC_FILE });
-            self.tier_moves.push(((l, e), slot));
             self.tier_swaps += 1;
         } else {
             pf.release(slot);
         }
         self.g.bind();
-        Ok(())
+        Ok(started)
+    }
+
+    /// While the server is idle (a pause of tier::IDLE_MS): one slice of tiering's moves on the engine thread. Commits
+    /// finished copies and starts the next prefetched move (at most one in flight per store); no token runs, so the
+    /// victim's CPU flag is set at once. Returns true while moves remain (the caller comes back at once).
+    pub fn tier_idle(&mut self) -> Result<bool> {
+        let Some(t) = crate::tier::global() else { return Ok(false) };
+        if !self.tier_swap || !t.is_idle() {
+            return Ok(false);
+        }
+        self.commit_swaps(false)?;
+        let started = self.tier_step()?;
+        if let Some(w) = self.worker.as_ref() {
+            for (i, v) in self.adapt_flags.drain(..) {
+                w.on_cpu[i].store(v, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(started || !self.tier_moves.is_empty())
     }
 
     /// After a sampled token's sync: its timed layer's expert-kernel time per store and the main GPU's waits, for
@@ -1270,9 +1322,10 @@ impl<'m> GpuModel<'m> {
                 t.note_gpu_ms(0, self.g.elapsed_ms(a, b)? as f64);
             }
         }
-        if let Some([w0, w1, w2]) = self.twait {
-            if self.g.done(w2)? {
-                t.note_waits(self.g.elapsed_ms(w0, w1)? as f64, self.g.elapsed_ms(w1, w2)? as f64);
+        if let Some(w) = self.twait.clone() {
+            if self.g.done(*w.last().unwrap())? {
+                let aux: Vec<f64> = (2..w.len()).map(|k| self.g.elapsed_ms(w[k - 1], w[k]).map(|x| x as f64)).collect::<Result<_>>()?;
+                t.note_waits(self.g.elapsed_ms(w[0], w[1])? as f64, &aux);
             }
         }
         for (i, x) in self.aux.iter().enumerate() {
