@@ -32,7 +32,7 @@ on) this says which device is on the critical path, and tiering moves work away 
 
 | The main GPU waits | Meaning | What tiering does |
 |---|---|---|
-| for an aux GPU (> 20 µs after the CPU) | that aux GPU finishes last | **exchanges**: its hottest experts swap places with colder ones on a GPU that is not late: the main GPU, or an aux GPU the main GPU does not wait for |
+| for an aux GPU (> 20 µs after the CPU) | that aux GPU finishes last | **exchanges**: its hottest experts swap places with colder ones on a fixed-set GPU that is not late: the main GPU, or an aux GPU the main GPU does not wait for |
 | for the CPU (> 20 µs), not for aux GPUs | the CPU finishes last | **moves**: hot experts the CPU computes go onto GPUs with a fixed set that are not late |
 | for nobody | the main GPU is last or all are even | nothing |
 
@@ -52,7 +52,8 @@ adaptive replacement (`GpuExperts::begin_swap` / `commit_ready`):
   side. Then the victim leaves the store's table first and the CPU computes it from the next token on; the new expert's
   bytes go to the victim's slot on the side stream after the current token's kernels and enter the table only when the
   copy has completed.
-- **Exchange between GPUs** (a late GPU and one that is not; any number and mix of GPUs, of any size and speed): the hot expert leaves the late GPU's table and the other GPU's colder victim leaves its table, both before
+- **Exchange between GPUs** (a late GPU and one that is not, both with a fixed set; any number and mix of GPUs, of
+  any size and speed): the hot expert leaves the late GPU's table and the other GPU's colder victim leaves its table, both before
   either copy starts. Until the copies land, the CPU computes both. Then the hot expert is resident on the GPU with
   room and the victim in the hot expert's old slot. Both stores stay full; no expert is ever resident on two GPUs.
 - **Move into the arena** (pauses only): an expert the CPU reads from the file side takes the place of another one's
@@ -62,14 +63,11 @@ adaptive replacement (`GpuExperts::begin_swap` / `commit_ready`):
   its lock. With enough pauses the experts in use end up on GPUs and in RAM, and the disk is no longer read.
 
 An adaptive store (`DSX_ADAPT`) may hand any resident back to the CPU at any token, so dsx keeps an arena copy of each
-of them. Tiering keeps that rule. An expert of another GPU that should enter an adaptive store first gets an arena
-copy in a pause (in place of a copy nobody reads, else of a cold one); a later round exchanges it, and the engine
-checks the copy again. The expert that leaves the adaptive store for a fixed set no longer needs its copy, which is
-what the next one takes. Copies of an adaptive store's residents are never taken.
-
-An adaptive store also replaces residents by recent use on its own: what it takes from another GPU can end up on the
-CPU. So it takes part only for a GPU late by a clear margin (40 µs), and an exchanged expert rests for 15 minutes
-before it can be exchanged again. `adaptive_swaps` in the stats counts the store's own replacements.
+of them. Tiering keeps that rule: it moves nothing into an adaptive store and never takes its residents' copies.
+Exchanges into an adaptive store were tried and removed: on a 3090 (adaptive) + CMP 170HX they took the CMP off the
+critical path, but the store handed more experts back to the CPU (5.8 -> 8.2 and 6.9 -> 9.2 picks per token) and the
+decode rate did not rise. An exchanged expert rests for 15 minutes before it can be exchanged again.
+`adaptive_swaps` in the stats counts an adaptive store's own replacements.
 
 GPUs differ in size and speed. A larger store holds more experts and gets more picks; a slower GPU needs longer for
 each. Neither is configured or assumed: an exchange is one expert for one of the same size, so every store stays as
@@ -77,7 +75,13 @@ full as placement made it, and the measured waits decide the direction and when 
 
 A candidate needs a learned score of at least 8 and a victim of at most half its score; a wasted arena copy makes
 room for any expert the CPU reads from disk (the hottest residents' copies go first: cold residents are the next
-victims and need theirs). Stores that already swap by recent use (`DSX_ADAPT`) keep doing so and
+victims and need theirs).
+
+## Where a token's time goes
+
+`token_ms` in the stats splits a decode token from what is measured anyway: `total` (decode rate), `main_gpu_experts`
+(the main GPU's expert kernels), `waiting` (for the CPU and the aux GPUs) and `rest_main_gpu` (attention, router, head
+and whatever else the main GPU does alone). Tiering can only shorten `waiting`. Stores that already swap by recent use (`DSX_ADAPT`) keep doing so and
 take part in exchanges.
 
 ## Pick patterns (measured, not acted on)
@@ -155,6 +159,7 @@ tier: {"picks":{…},"share_from_file":…,"experts_on_gpus":…,"moves_planned"
 
 - The arena's size is fixed at startup (`--arena-gb`); its contents follow use in pauses.
 - GPU memory budgets are taken at startup; a GPU added or freed while the server runs is used at the next start.
+- An adaptive store takes no part in exchanges (see above).
 - Work only leaves GPUs the main GPU waits for; when the main GPU itself finishes last, nothing measures how much
   room the others have, and nothing moves. The main GPU is still chosen by host link.
 - A full SSD buffer keeps what it holds; it does not follow later changes of use.
