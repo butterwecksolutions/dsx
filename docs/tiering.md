@@ -80,6 +80,15 @@ room for any expert the CPU reads from disk (the hottest residents' copies go fi
 victims and need theirs). Stores that already swap by recent use (`DSX_ADAPT`) keep doing so and
 take part in exchanges.
 
+## Pick patterns (measured, not acted on)
+
+Adaptive stores load by recent use. Whether loading by pattern could do better is measured, not assumed: per layer
+and expert a small table keeps the four experts most often picked at the next decode token. Before a token is learned
+from, the picks the CPU computes are scored against what the table said after the token before. `pattern` in the
+stats: `repeat_share` (picked at the token before too: recent use already knows these), `guessed_share` and
+`guessed_new_share` (guessed by the table; guessed and not a repeat), `guesses_per_token` (experts the CPU would have
+had to hand to a GPU for it) and `guess_precision`. Nothing is moved on its account.
+
 ## State
 
 `<model file>.tier.json` next to the model when its directory is writable, else in `$DSX_STATE_DIR`,

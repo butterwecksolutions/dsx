@@ -158,6 +158,8 @@ pub struct Tier {
     moved: Vec<AtomicU32>,
     /// replacements adaptive stores started on their own
     adaptive_swaps: AtomicU64,
+    /// which experts follow which, and how well that would have predicted the CPU's picks (measured, not acted on)
+    pattern: Mutex<Pattern>,
     t0: std::time::Instant,
 }
 
@@ -226,6 +228,7 @@ impl Tier {
             done: Default::default(),
             moved: (0..nl * ne).map(|_| AtomicU32::new(0)).collect(),
             adaptive_swaps: AtomicU64::new(0),
+            pattern: Mutex::new(Pattern::new(nl, ne)),
             t0: std::time::Instant::now(),
         }
     }
@@ -248,6 +251,16 @@ impl Tier {
             if let Some(c) = self.picks.get(base + e as usize) {
                 c.store(c.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
             }
+        }
+    }
+
+    /// A decode token's picks of layer `l` (`on_cpu`: the CPU computes that expert): scores the successor table's guess
+    /// for this token, then learns from it. `None` breaks the sequence (a multi-token pass).
+    pub fn note_pattern(&self, l: usize, sel: Option<&[i32]>, on_cpu: impl Fn(usize) -> bool) {
+        let mut p = self.pattern.lock().unwrap();
+        match sel {
+            Some(sel) => p.step(l, sel, on_cpu),
+            None => p.cut(l),
         }
     }
 
@@ -811,6 +824,116 @@ impl Waits {
     pub fn early(&self, stores: usize) -> Vec<usize> {
         let late = self.late(stores, WAIT_US);
         (0..stores).filter(|i| !late.contains(i)).collect()
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ pick patterns
+
+/// successors kept per expert, and the count from which one is a guess
+const PATTERN_SLOTS: usize = 4;
+const PATTERN_MIN: u16 = 3;
+const PATTERN_TOP_K: usize = 16;
+
+/// Per layer and expert: the experts most often picked in the same layer at the next decode token (a small
+/// frequent-items table). Before learning from a token, its picks the CPU computes are scored against what the table
+/// said after the token before: this measures whether loading by pattern could beat loading by recent use. Nothing is
+/// moved on its account.
+pub struct Pattern {
+    ne: usize,
+    succ: Vec<[(u16, u16); PATTERN_SLOTS]>,
+    prev: Vec<([u16; PATTERN_TOP_K], usize)>,
+    /// CPU picks scored; of those: picked at the token before too; guessed by the table; guessed and not a repeat
+    pub cpu_picks: u64,
+    pub repeats: u64,
+    pub hits: u64,
+    pub new_hits: u64,
+    /// experts the table guessed that the CPU would have had to hand to a GPU, and layer-tokens scored
+    pub guesses: u64,
+    pub steps: u64,
+}
+
+impl Pattern {
+    pub fn new(nl: usize, ne: usize) -> Pattern {
+        let none = [(u16::MAX, 0); PATTERN_SLOTS];
+        let fits = ne < u16::MAX as usize;
+        Pattern { ne, succ: if fits { vec![none; nl * ne] } else { vec![] }, prev: vec![([0; PATTERN_TOP_K], 0); nl], cpu_picks: 0, repeats: 0, hits: 0, new_hits: 0, guesses: 0, steps: 0 }
+    }
+
+    pub fn cut(&mut self, l: usize) {
+        if let Some(p) = self.prev.get_mut(l) {
+            p.1 = 0;
+        }
+    }
+
+    pub fn step(&mut self, l: usize, sel: &[i32], on_cpu: impl Fn(usize) -> bool) {
+        let ne = self.ne;
+        if l >= self.prev.len() || self.succ.is_empty() || sel.iter().any(|&e| e < 0 || e as usize >= ne) {
+            return;
+        }
+        let sel = &sel[..sel.len().min(PATTERN_TOP_K)];
+        let (prev, n) = self.prev[l];
+        let prev = &prev[..n];
+        if n > 0 {
+            // the guess for this token: successors seen often enough after the experts of the token before
+            let mut guess: Vec<u16> = vec![];
+            for &a in prev {
+                for &(e, c) in &self.succ[l * ne + a as usize] {
+                    if c >= PATTERN_MIN && !guess.contains(&e) {
+                        guess.push(e);
+                    }
+                }
+            }
+            self.steps += 1;
+            self.guesses += guess.iter().filter(|&&e| on_cpu(e as usize)).count() as u64;
+            for &e in sel {
+                if !on_cpu(e as usize) {
+                    continue;
+                }
+                let (rep, hit) = (prev.contains(&(e as u16)), guess.contains(&(e as u16)));
+                self.cpu_picks += 1;
+                self.repeats += rep as u64;
+                self.hits += hit as u64;
+                self.new_hits += (hit && !rep) as u64;
+            }
+            // learn: every pick of this token follows every pick of the token before
+            for &a in prev {
+                let slots = &mut self.succ[l * ne + a as usize];
+                for &e in sel {
+                    let e = e as u16;
+                    if let Some(s) = slots.iter_mut().find(|s| s.0 == e) {
+                        s.1 += 1;
+                        if s.1 >= u16::MAX / 2 {
+                            slots.iter_mut().for_each(|s| s.1 /= 2);
+                        }
+                    } else {
+                        // the weakest slot loses a count; an empty one takes the newcomer
+                        let s = slots.iter_mut().min_by_key(|s| s.1).unwrap();
+                        if s.1 <= 1 {
+                            *s = (e, 1);
+                        } else {
+                            s.1 -= 1;
+                        }
+                    }
+                }
+            }
+        }
+        let p = &mut self.prev[l];
+        p.1 = sel.len();
+        for (i, &e) in sel.iter().enumerate() {
+            p.0[i] = e as u16;
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let share = |a: u64, b: u64| if b > 0 { ((a as f64 / b as f64) * 1000.0).round() / 1000.0 } else { 0.0 };
+        serde_json::json!({
+            "cpu_picks": self.cpu_picks,
+            "repeat_share": share(self.repeats, self.cpu_picks),
+            "guessed_share": share(self.hits, self.cpu_picks),
+            "guessed_new_share": share(self.new_hits, self.cpu_picks),
+            "guesses_per_token": if self.steps > 0 { ((self.guesses as f64 / self.steps as f64 * self.prev.len() as f64) * 10.0).round() / 10.0 } else { 0.0 },
+            "guess_precision": share(self.hits, self.guesses),
+        })
     }
 }
 
@@ -1490,6 +1613,7 @@ impl Background {
             "moves_done": {"cpu_to_gpu": self.tier.done[0].load(Ordering::Relaxed), "between_gpus": self.tier.done[1].load(Ordering::Relaxed),
                            "file_to_ram": self.tier.done[2].load(Ordering::Relaxed)},
             "adaptive_swaps": self.tier.adaptive_swaps.load(Ordering::Relaxed),
+            "pattern": self.tier.pattern.lock().unwrap().json(),
             "wait_ms_per_token": (((self.tier.waits().cpu_us + self.tier.waits().aux_total_us()) * self.tier.nl as f64 / 1000.0) * 10.0).round() / 10.0,
             "wait_for_cpu_us": self.tier.waits().cpu_us.round(),
             "wait_for_aux_us": self.tier.waits().aux_total_us().round(),
@@ -1998,6 +2122,36 @@ mod tests {
         let loc2 = [LOC_GPU, LOC_ARENA, LOC_ARENA, LOC_FILE, LOC_FILE, LOC_GPU];
         let m = plan_arena(6, &score, &loc2, &key, &in_arena5, &[false], &[], &[], 1);
         assert_eq!(m, vec![Move { new: (0, 3), store: TO_ARENA, victim: (0, 5), from: None }]);
+    }
+
+    #[test]
+    fn pattern_guesses_what_follows_and_scores_only_cpu_picks() {
+        // 1 layer x 8, top-2. A fixed cycle: {0,1} -> {2,3} -> {4,5} -> {0,1} ...; expert 4 and 5 are the CPU's
+        let mut p = Pattern::new(1, 8);
+        let cpu = |e: usize| e >= 4;
+        let cycle = [[0, 1], [2, 3], [4, 5]];
+        for i in 0..30 {
+            p.step(0, &cycle[i % 3], cpu);
+        }
+        // 20 CPU picks scored (first token has no predecessor); once the table has seen {2,3} -> {4,5} three times the
+        // guess is right, and none of them is a repeat of the token before
+        assert_eq!((p.cpu_picks, p.repeats), (20, 0));
+        assert_eq!(p.hits, p.new_hits);
+        assert_eq!(p.hits, 14, "7 rounds after 3 to learn");
+        // a guess counts only when the CPU holds the expert: {4,5} after {2,3}, nothing else
+        assert_eq!(p.guesses, 14);
+        // a multi-token pass breaks the sequence: the next token is not scored or learned from
+        let before = (p.cpu_picks, p.steps);
+        p.cut(0);
+        p.step(0, &[4, 5], cpu);
+        assert_eq!((p.cpu_picks, p.steps), before);
+        // repeats are counted apart: recent use already knows them
+        p.step(0, &[4, 5], cpu);
+        assert_eq!(p.repeats, 2);
+        // out of range input is ignored
+        p.step(0, &[9, 1], cpu);
+        p.step(3, &[0, 1], cpu);
+        assert_eq!(Pattern::new(1, 70000).succ.len(), 0);
     }
 
     #[test]
