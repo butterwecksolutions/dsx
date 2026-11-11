@@ -9,10 +9,10 @@
 //!   depend on the hardware: one score serves every GPU combination the model is started with.
 //! * **Who is waited for.** Every 64th decode token one layer (rotating) is timed on the main GPU: after its own work
 //!   it waits for the CPU's experts, then for each aux GPU (`Waits`). The device that finishes last gets work taken
-//!   away: a late aux GPU exchanges its hottest experts for colder ones of a fixed-set GPU that is not late
+//!   away: a late aux GPU exchanges its hottest experts for colder ones of a GPU that is not late
 //!   (`plan_exchanges`); a late CPU hands hot experts to fixed-set GPU stores that are not late (`plan_moves`).
-//!   Adaptive stores keep an arena copy of every resident (they hand experts back to the CPU at any token), so
-//!   nothing that may lack one is moved into them.
+//!   Adaptive stores keep an arena copy of every resident (they hand experts back to the CPU at any token): an
+//!   expert gets its copy in a pause before an exchange takes it into one.
 //! * **Arena.** In pauses, experts the CPU reads from the file side take the place of arena copies nobody reads
 //!   (experts resident on fixed-set GPUs), then of cold ones (`plan_arena`, `Arena::replace` on the engine thread), so
 //!   what is in use ends up on GPUs and in RAM.
@@ -592,18 +592,23 @@ pub fn plan_moves(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[S
 /// Plan up to `room` exchanges that take work off GPUs finishing last (`late`, store indices) onto GPUs that do not
 /// (`early`: the main GPU, which waits for the others, and aux GPUs it does not wait for): the hottest expert of a late
 /// store swaps places with the coldest resident of the same key in an early store, if that one has at most `MOVE_RATIO`
-/// of its score. Both stores stay full; the late one keeps a colder expert. Only fixed-set stores take part: an adaptive
-/// store keeps an arena copy of every resident, which an expert coming from another GPU does not have.
+/// of its score. Both stores stay full; the late one keeps a colder expert. Stores differ in size and speed: the pairs
+/// are one for one and of the same size, and the waits say when to stop.
+/// An adaptive store keeps an arena copy of every resident (it hands them back to the CPU at any token). An expert that
+/// would enter one without a copy is not exchanged yet: it is returned in the second list, to get a copy first
+/// (`plan_arena`); a later round exchanges it.
 #[allow(clippy::too_many_arguments)]
-pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[StoreInfo], late: &[usize], early: &[usize], busy: &[Move], room: usize) -> Vec<Move> {
+pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], in_arena: &[bool], stores: &[StoreInfo], late: &[usize], early: &[usize], busy: &[Move], room: usize) -> (Vec<Move>, Vec<usize>) {
     let ne = ne.max(1);
-    let can = |i: usize| stores.get(i).is_some_and(|s| s.tier_swaps);
+    let can = |i: usize| stores.get(i).is_some_and(|s| s.swaps);
+    let adaptive = |i: usize| stores.get(i).is_some_and(|s| s.adaptive());
     let late: Vec<usize> = late.iter().copied().filter(|&i| can(i)).collect();
     let early: Vec<usize> = early.iter().copied().filter(|&i| can(i) && !late.contains(&i)).collect();
     if room == 0 || late.is_empty() || early.is_empty() {
-        return vec![];
+        return (vec![], vec![]);
     }
     let mut off: std::collections::HashSet<usize> = busy.iter().flat_map(|m| [m.new, m.victim]).map(|(l, e)| l * ne + e).collect();
+    let mut stage = vec![];
     // early stores' residents by key, coldest last
     let mut cold: HashMap<u32, Vec<(f64, usize, usize)>> = HashMap::new();
     let mut hot: Vec<(f64, usize, usize)> = vec![];
@@ -621,7 +626,7 @@ pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores:
     hot.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut out = vec![];
     for (sc, i, src) in hot {
-        if out.len() >= room {
+        if out.len() + stage.len() >= room {
             break;
         }
         if off.contains(&i) {
@@ -638,18 +643,25 @@ pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores:
         list.pop();
         off.insert(i);
         off.insert(vi);
-        out.push(Move { new: (i / ne, i % ne), store: dst, victim: (vi / ne, vi % ne), from: Some(src) });
+        // whoever enters an adaptive store needs an arena copy
+        let need: Vec<usize> = [(i, dst), (vi, src)].into_iter().filter(|&(x, to)| adaptive(to) && !in_arena.get(x).copied().unwrap_or(false)).map(|(x, _)| x).collect();
+        if need.is_empty() {
+            out.push(Move { new: (i / ne, i % ne), store: dst, victim: (vi / ne, vi % ne), from: Some(src) });
+        } else {
+            stage.extend(need);
+        }
     }
-    out
+    (out, stage)
 }
 
-/// Plan up to `room` moves into the RAM arena. Candidates: experts the CPU computes without an arena copy (it reads
-/// them from the file side), hottest first. Victims, same key (so the same byte lengths): first arena copies of experts
+/// Plan up to `room` moves into the RAM arena. Candidates: first `stage` (GPU residents that need an arena copy before
+/// an exchange into an adaptive store), then experts the CPU computes without an arena copy (it reads them from the
+/// file side), hottest first. Victims, same key (so the same byte lengths): first arena copies of experts
 /// resident on a fixed-set GPU store (the CPU never reads them; an adaptive store's residents keep theirs, since that
 /// store may hand them back to the CPU at any token), then the coldest experts the CPU reads from the arena, at most
 /// `MOVE_RATIO` of the candidate's score. `in_arena` per expert; `adaptive` per store.
 #[allow(clippy::too_many_arguments)]
-pub fn plan_arena(ne: usize, score: &[f64], loc: &[u8], key: &[u32], in_arena: &[bool], adaptive: &[bool], busy: &[Move], room: usize) -> Vec<Move> {
+pub fn plan_arena(ne: usize, score: &[f64], loc: &[u8], key: &[u32], in_arena: &[bool], adaptive: &[bool], stage: &[usize], busy: &[Move], room: usize) -> Vec<Move> {
     let ne = ne.max(1);
     let mut off: std::collections::HashSet<usize> = busy.iter().flat_map(|m| [m.new, m.victim]).map(|(l, e)| l * ne + e).collect();
     // per key: (wasted?, score, index), the best victim last
@@ -672,8 +684,10 @@ pub fn plan_arena(ne: usize, score: &[f64], loc: &[u8], key: &[u32], in_arena: &
         v.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
     }
     hot.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // a staged expert's own copy-to-be and its exchange partner are no victims
+    let staged: Vec<(f64, usize)> = stage.iter().filter(|&&i| i < score.len() && !in_arena[i] && !off.contains(&i)).map(|&i| (score[i], i)).collect();
     let mut out = vec![];
-    for (sc, i) in hot {
+    for (sc, i) in staged.into_iter().chain(hot) {
         if out.len() >= room {
             break;
         }
@@ -1455,7 +1469,8 @@ impl Background {
         let w = self.tier.waits();
         let score = &self.saved.learned.score;
         // work off GPUs that finish last first, then off the CPU onto GPUs with room
-        let mut moves = plan_exchanges(ne, score, &loc, key, stores, &w.late(stores.len()), &w.early(stores.len()), &busy, free);
+        let in_arena: Vec<bool> = (0..self.tier.nl * ne).map(|i| self.tier.in_arena(i)).collect();
+        let (mut moves, stage) = plan_exchanges(ne, score, &loc, key, &in_arena, stores, &w.late(stores.len()), &w.early(stores.len()), &busy, free);
         busy.extend(moves.iter().copied());
         if stores.iter().any(|s| s.tier_swaps) {
             let more = plan_moves(ne, score, &loc, key, stores, &w.open(stores.len()), &busy, free - moves.len());
@@ -1465,9 +1480,8 @@ impl Background {
         // the arena follows use in pauses: hot experts of the file side take the place of cold ones in it
         let arena_busy = busy.iter().filter(|m| m.store == TO_ARENA).count();
         if self.tier.is_idle() && arena_busy < ARENA_SLOTS {
-            let in_arena: Vec<bool> = (0..self.tier.nl * ne).map(|i| self.tier.in_arena(i)).collect();
             let adaptive: Vec<bool> = stores.iter().map(|s| s.adaptive()).collect();
-            let more = plan_arena(ne, score, &loc, key, &in_arena, &adaptive, &busy, (free - moves.len()).min(ARENA_SLOTS - arena_busy));
+            let more = plan_arena(ne, score, &loc, key, &in_arena, &adaptive, &stage, &busy, (free - moves.len()).min(ARENA_SLOTS - arena_busy));
             moves.extend(more);
         }
         let mut n = 0;
@@ -1866,21 +1880,28 @@ mod tests {
         let loc = [LOC_GPU, LOC_GPU, LOC_GPU + 1, LOC_GPU + 1, LOC_GPU + 1, LOC_ARENA, LOC_FILE, LOC_FILE];
         let key = [1, 1, 1, 1, 2, 1, 1, 1];
         let score = [2.0, 40.0, 50.0, 90.0, 500.0, 70.0, 0.0, 0.0];
-        let m = plan_exchanges(8, &score, &loc, &key, &stores, &[1], &[0], &[], 4);
+        let (m, _) = plan_exchanges(8, &score, &loc, &key, &[false; 8], &stores, &[1], &[0], &[], 4);
         // 90 swaps with the coldest main resident (2); 50 would need one at most 25: 40 is too warm
         assert_eq!(m, vec![Move { new: (0, 3), store: 0, victim: (0, 0), from: Some(1) }]);
-        assert!(plan_exchanges(8, &score, &loc, &key, &stores, &[], &[0, 1], &[], 4).is_empty(), "nothing late");
-        assert!(plan_exchanges(8, &score, &loc, &key, &[st(false), st(true)], &[1], &[0], &[], 4).is_empty(), "main cannot swap");
-        // an adaptive store (swaps by itself, no tier moves) takes no expert from another GPU: it lacks an arena copy
-        let adaptive = StoreInfo { uuid: "u".into(), name: "n".into(), link_gbs: 1.0, tier_swaps: false, swaps: true };
-        assert!(adaptive.adaptive());
-        assert!(plan_exchanges(8, &score, &loc, &key, &[adaptive, st(true)], &[1], &[0], &[], 4).is_empty(), "main is adaptive");
-        assert!(plan_exchanges(8, &score, &loc, &key, &stores, &[1], &[0], &m, 4).is_empty(), "in transit");
+        assert!(plan_exchanges(8, &score, &loc, &key, &[false; 8], &stores, &[], &[0, 1], &[], 4).0.is_empty(), "nothing late");
+        assert!(plan_exchanges(8, &score, &loc, &key, &[false; 8], &[st(false), st(true)], &[1], &[0], &[], 4).0.is_empty(), "main cannot swap");
+        // an adaptive main store (swaps by itself, no tier moves) keeps an arena copy of every resident: the hot expert
+        // of the late GPU first gets one (second list), then a later round exchanges it
+        let adaptive = || StoreInfo { uuid: "u".into(), name: "n".into(), link_gbs: 1.0, tier_swaps: false, swaps: true };
+        assert!(adaptive().adaptive());
+        let (mv, stage) = plan_exchanges(8, &score, &loc, &key, &[false; 8], &[adaptive(), st(true)], &[1], &[0], &[], 4);
+        assert!(mv.is_empty(), "no copy yet: {mv:?}");
+        assert_eq!(stage, vec![3]);
+        let mut copies = [false; 8];
+        copies[3] = true;
+        let (mv, stage) = plan_exchanges(8, &score, &loc, &key, &copies, &[adaptive(), st(true)], &[1], &[0], &[], 4);
+        assert_eq!((mv, stage), (m.clone(), vec![]));
+        assert!(plan_exchanges(8, &score, &loc, &key, &[false; 8], &stores, &[1], &[0], &m, 4).0.is_empty(), "in transit");
         // three GPUs of different kinds: the late one (2) hands its hottest to whichever early GPU holds the coldest
         let stores3 = vec![st(true), st(true), st(true)];
         let loc3 = [LOC_GPU, LOC_GPU + 1, LOC_GPU + 2, LOC_GPU + 2, LOC_ARENA, LOC_FILE, LOC_FILE, LOC_FILE];
         let score3 = [30.0, 3.0, 80.0, 9.0, 0.0, 0.0, 0.0, 0.0];
-        let m3 = plan_exchanges(8, &score3, &loc3, &[1; 8], &stores3, &[2], &[0, 1], &[], 4);
+        let (m3, _) = plan_exchanges(8, &score3, &loc3, &[1; 8], &[false; 8], &stores3, &[2], &[0, 1], &[], 4);
         assert_eq!(m3, vec![Move { new: (0, 2), store: 1, victim: (0, 1), from: Some(2) }]);
     }
 
@@ -1891,21 +1912,25 @@ mod tests {
         let key = [1, 1, 2, 1, 1, 1];
         let score = [4.0, 30.0, 0.0, 50.0, 20.0, 99.0];
         let in_arena = [true, true, true, false, false, false];
-        let m = plan_arena(6, &score, &loc, &key, &in_arena, &[true], &[], 4);
+        let m = plan_arena(6, &score, &loc, &key, &in_arena, &[true], &[], &[], 4);
         // 50 takes the place of 4; 20 would need a victim of at most 10: 30 is too warm
         assert_eq!(m, vec![Move { new: (0, 3), store: TO_ARENA, victim: (0, 0), from: None }]);
-        assert!(plan_arena(6, &score, &loc, &key, &in_arena, &[true], &m, 4).is_empty(), "in transit");
-        assert!(plan_arena(6, &score, &[LOC_FILE; 6], &key, &[false; 6], &[true], &[], 4).is_empty(), "no arena");
+        assert!(plan_arena(6, &score, &loc, &key, &in_arena, &[true], &[], &m, 4).is_empty(), "in transit");
+        assert!(plan_arena(6, &score, &[LOC_FILE; 6], &key, &[false; 6], &[true], &[], &[], 4).is_empty(), "no arena");
         // 5 is resident on a store and still has an arena copy: on a fixed-set store nobody reads that copy, so it goes
         // first, even for the lukewarm 4; on an adaptive store it stays (the store may hand 5 back to the CPU)
         let in_arena5 = [true, true, true, false, false, true];
-        let m = plan_arena(6, &score, &loc, &key, &in_arena5, &[false], &[], 4);
+        let m = plan_arena(6, &score, &loc, &key, &in_arena5, &[false], &[], &[], 4);
         assert_eq!(m, vec![
             Move { new: (0, 3), store: TO_ARENA, victim: (0, 5), from: None },
             Move { new: (0, 4), store: TO_ARENA, victim: (0, 0), from: None },
         ]);
-        let m = plan_arena(6, &score, &loc, &key, &in_arena5, &[true], &[], 4);
+        let m = plan_arena(6, &score, &loc, &key, &in_arena5, &[true], &[], &[], 4);
         assert_eq!(m, vec![Move { new: (0, 3), store: TO_ARENA, victim: (0, 0), from: None }]);
+        // staging: GPU resident 5 (no copy yet) needs one before an exchange; it comes first and takes the cold 0
+        let m = plan_arena(6, &score, &loc, &key, &in_arena, &[false], &[5], &[], 1);
+        assert_eq!(m, vec![Move { new: (0, 5), store: TO_ARENA, victim: (0, 0), from: None }]);
+        assert!(plan_arena(6, &score, &loc, &key, &in_arena5, &[false], &[5], &[], 1).iter().all(|x| x.new != (0, 5)), "has its copy");
     }
 
     #[test]
