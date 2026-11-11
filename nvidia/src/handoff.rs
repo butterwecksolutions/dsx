@@ -289,7 +289,6 @@ impl CpuWorker {
                     let (sel, wts) = (xch.sel(nt * top_k).to_vec(), xch.wts(nt * top_k).to_vec());
                     if let Some(t) = tier {
                         t.note_picks(l, &sel);
-                        t.note_pattern(l, (nt == 1).then_some(&sel[..]), |e| oc[l * ne + e].load(Ordering::Relaxed));
                         if l + 1 == nl {
                             t.note_decode();
                         }

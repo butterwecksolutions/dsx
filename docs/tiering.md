@@ -4,6 +4,8 @@ dsx places routed experts over the GPUs, a RAM arena and the model file at start
 ([placement](placement.md)). Adaptive GPU stores then swap experts by recent use; every other store keeps the set it
 got at startup, and what the server learned about this machine's traffic is gone after a restart.
 
+`DSX_TIER=0` turns all of it off, for comparing with and without on one build.
+
 `nvidia/src/tier.rs` learns which experts this machine uses, measures which device each layer waits for, moves work
 toward the devices with room while the server runs, and keeps all of it next to the model for the next start. It needs
 no option and adapts to whatever GPUs, RAM and disks a start finds.
@@ -84,15 +86,6 @@ victims and need theirs).
 and whatever else the main GPU does alone). Tiering can only shorten `waiting`. Stores that already swap by recent use (`DSX_ADAPT`) keep doing so and
 take part in exchanges.
 
-## Pick patterns (measured, not acted on)
-
-Adaptive stores load by recent use. Whether loading by pattern could do better is measured, not assumed: per layer
-and expert a small table keeps the four experts most often picked at the next decode token. Before a token is learned
-from, the picks the CPU computes are scored against what the table said after the token before. `pattern` in the
-stats: `repeat_share` (picked at the token before too: recent use already knows these), `guessed_share` and
-`guessed_new_share` (guessed by the table; guessed and not a repeat), `guesses_per_token` (experts the CPU would have
-had to hand to a GPU for it) and `guess_precision`. Nothing is moved on its account.
-
 ## State
 
 `<model file>.tier.json` next to the model when its directory is writable, else in `$DSX_STATE_DIR`,
@@ -163,5 +156,20 @@ tier: {"picks":{…},"share_from_file":…,"experts_on_gpus":…,"moves_planned"
 - Work only leaves GPUs the main GPU waits for; when the main GPU itself finishes last, nothing measures how much
   room the others have, and nothing moves. The main GPU is still chosen by host link.
 - A full SSD buffer keeps what it holds; it does not follow later changes of use.
-- No measurement on a GPU machine is part of this change yet; it needs an A-B-A-B comparison with otherwise
-  identical settings.
+- Loading by pattern was measured and not built: a table of the four experts most often picked at the next token
+  guessed 8 % of the CPU's picks beyond plain repeats (12 %), at 7 % precision.
+
+## Measured
+
+One machine: RTX 3090 (main, adaptive, 24 GB) + CMP 170HX (aux, fixed set), DDR4 host, DeepSeek V4.1 Flash, decode of
+three fixed 300-token requests. Before/after over several days, not yet an A-B-A-B on one build:
+
+| | CPU picks per token | decode tok/s |
+|---|---|---|
+| ranking as shipped | 12.5 | 35–38 |
+| learned placement after ~45k decode tokens | ~9.7 | 39–42 |
+| + moves from the CPU, arena follows use | 5.8–7.9 | 40–42 |
+
+Run-time moves lowered the CPU's picks and the main GPU's waits (to ~1.9 ms of a 24.3 ms token) without raising the
+decode rate on this machine; the gain comes from the learned placement at startup. No pick is computed from the file
+side once the arena has followed use.
