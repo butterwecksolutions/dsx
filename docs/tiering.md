@@ -48,7 +48,8 @@ reads nothing from disk. Between two tokens, or in a pause, the engine checks th
 adaptive replacement (`GpuExperts::begin_swap` / `commit_ready`):
 
 - **Move from the CPU** (into a store that keeps a fixed set: the main GPU's with `DSX_ADAPT=0`, aux GPUs on slower
-  links): the victim leaves the store's table first and the CPU computes it from the next token on; the new expert's
+  links): with an arena the victim first gets its arena copy in a pause, so the CPU never computes it from the file
+  side. Then the victim leaves the store's table first and the CPU computes it from the next token on; the new expert's
   bytes go to the victim's slot on the side stream after the current token's kernels and enter the table only when the
   copy has completed.
 - **Exchange between GPUs** (a late GPU and one that is not; any number and mix of GPUs, of any size and speed): the hot expert leaves the late GPU's table and the other GPU's colder victim leaves its table, both before
@@ -66,12 +67,17 @@ copy in a pause (in place of a copy nobody reads, else of a cold one); a later r
 checks the copy again. The expert that leaves the adaptive store for a fixed set no longer needs its copy, which is
 what the next one takes. Copies of an adaptive store's residents are never taken.
 
+An adaptive store also replaces residents by recent use on its own: what it takes from another GPU can end up on the
+CPU. So it takes part only for a GPU late by a clear margin (40 µs), and an exchanged expert rests for 15 minutes
+before it can be exchanged again. `adaptive_swaps` in the stats counts the store's own replacements.
+
 GPUs differ in size and speed. A larger store holds more experts and gets more picks; a slower GPU needs longer for
 each. Neither is configured or assumed: an exchange is one expert for one of the same size, so every store stays as
 full as placement made it, and the measured waits decide the direction and when to stop.
 
 A candidate needs a learned score of at least 8 and a victim of at most half its score; a wasted arena copy makes
-room for any expert the CPU reads from disk. Stores that already swap by recent use (`DSX_ADAPT`) keep doing so and
+room for any expert the CPU reads from disk (the hottest residents' copies go first: cold residents are the next
+victims and need theirs). Stores that already swap by recent use (`DSX_ADAPT`) keep doing so and
 take part in exchanges.
 
 ## State

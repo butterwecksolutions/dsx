@@ -1173,6 +1173,9 @@ impl<'m> GpuModel<'m> {
             }
             started += 1;
             self.adapt_swaps += 1;
+            if let Some(t) = tier {
+                t.note_adaptive_swap();
+            }
         }
         Ok(())
     }
@@ -1293,7 +1296,9 @@ impl<'m> GpuModel<'m> {
         match mv.from {
             None => {
                 if let (true, Some(Some((g, s, adaptive))), Some(raw)) = (!busy && !new_on_gpu && on_cpu(l, e), stores.get_mut(mv.store), pf.parts(slot)) {
-                    if !*adaptive && s.has(vl, ve) && s.swap_room() > 0 && s.types(vl, ve) == Some(types) && fits(raw, x) {
+                    // the victim is the CPU's from the next token on: with an arena it has its copy there
+                    let copy = self.arena.is_none() || loc_victim == crate::tier::LOC_ARENA;
+                    if copy && !*adaptive && s.has(vl, ve) && s.swap_room() > 0 && s.types(vl, ve) == Some(types) && fits(raw, x) {
                         started = s.begin_swap(g, (vl, ve), (l, e), raw)?;
                     }
                 }
