@@ -215,7 +215,7 @@ impl CpuWorker {
                 // DSX_LOG_ROUTES=path: one line per (pass, layer) with every token's picks, for placement studies
                 let mut route_log = std::env::var("DSX_LOG_ROUTES").ok().and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new);
                 // automatic tiering: usage counts, served-from tier, SSD-buffer copies (tier.rs)
-                let tier = crate::tier::global();
+                let tier = crate::tier::for_worker(nl, ne);
                 loop {
                     seq += 1;
                     let l = (seq as usize - 1) % nl;

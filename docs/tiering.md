@@ -60,9 +60,10 @@ recent use (`DSX_ADAPT`) keep doing so; they take part in exchanges only as the 
 ## State
 
 `<model file>.tier.json` next to the model when its directory is writable, else in `$DSX_STATE_DIR`,
-`$XDG_STATE_HOME/dsx`, `~/.local/state/dsx` or `/var/tmp/dsx`. With an overlay the name gets `+<overlay stem>`
-(`model.gguf+uncensored-overlay.tier.json`): each model and overlay learns on its own. A change of any file (size or
-modification time) or of the model's shape starts fresh; a file of the first format (usage only) is read.
+`$XDG_STATE_HOME/dsx`, `~/.local/state/dsx` or `/var/tmp/dsx`; a state an earlier start left in another of these
+places is still read. With an overlay the name gets `+<overlay stem>` (`model.gguf+uncensored-overlay.tier.json`):
+each model and overlay learns on its own. A change of any file (path, size or modification time) or of the model's
+shape starts fresh.
 
 ```json
 {
@@ -85,21 +86,27 @@ modification time) or of the model's shape starts fresh; a file of the first for
 - `devices` are keyed by GPU UUID (the same in every `CUDA_VISIBLE_DEVICES` order) and by disk; a GPU missing in one
   start keeps its record.
 - Rotation: devices unseen for 90 days are dropped, at most 16 GPU combinations are kept, two state files at most.
+- Writes go to a temp file and are renamed over the state; the state before stays as `.prev` and is read when the
+  state itself is missing or damaged. Two servers on one model both write it: the last one wins, nothing is merged.
 - `--tier-reset` removes this model's state, its previous version and its SSD buffer at startup, then runs as usual.
 
 ## Budgets and safety
 
 - Page cache: at most 40 GB, never below 16 GB of `MemAvailable`, never closer than 4 GB to the process's memory cgroup
-  limit (`memory.max`). Warming and SSD copies run only in pauses: they would compete with the CPU's expert reads for
-  memory bandwidth.
-- SSD buffer: when the model's medium is rotational or reads below 1000 MB/s (measured with O_DIRECT at startup); in
+  limit (`memory.max`). Warming and SSD copies run only in pauses (a request counts as busy from its first to its
+  last token, prefill included): they would compete with the CPU's expert reads for memory bandwidth. The warm set is
+  walked again every 10 minutes, since the kernel may have evicted pages.
+- SSD buffer: when the model's medium is rotational or reads below 300 MB/s (measured with O_DIRECT at startup); in
   the first writable directory on another non-rotational device with more than 20 GB free (`$DSX_CACHE_DIR`, the
   state directory, `$XDG_CACHE_HOME/dsx`, `~/.cache/dsx`, `/var/tmp/dsx`); half its free space, at most 512 GB and at
-  most the size of the file-side experts. Entries are appended, synced and only then published.
+  most the size of the file-side experts. Entries are appended, synced and only then published; writing stops when
+  the disk has less than 20 GB left. A buffer of the same model is kept across starts and only grows. One process
+  uses it at a time (file lock); a second server on the model reads the model file.
+- The block device of a path is found by device number, else (btrfs and others) by its mount in `/proc/self/mountinfo`.
 - GPU memory: one staging buffer (the largest expert) per fixed-set store; nothing else is allocated at run time.
 - A failed timing query drops the sample; a failed pause slice stops that round. Only the first model of a process
-  claims the tiering state. Every other failure (no writable directory, no SSD, no pinned memory, unreadable state)
-  disables only that part.
+  gets tiering; its background thread is stopped and joined when the model is dropped. Every other failure (no
+  writable directory, no SSD, no pinned memory, unreadable state) disables only that part.
 
 ## What the log shows
 
@@ -118,5 +125,6 @@ tier: {"picks":{…},"share_from_file":…,"experts_on_gpus":…,"moves_planned"
   the SSD buffer serve the file side instead, and learned use reaches the arena at the next start.
 - GPU memory budgets are taken at startup; a GPU added or freed while the server runs is used at the next start.
 - Exchanges go between aux GPUs and the main GPU, not between two aux GPUs; the main GPU is still chosen by host link.
+- A full SSD buffer keeps what it holds; it does not follow later changes of use.
 - No measurement on a GPU machine is part of this change yet; it needs an A-B-A-B comparison with otherwise
   identical settings.

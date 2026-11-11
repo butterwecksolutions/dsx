@@ -49,8 +49,10 @@ const CGROUP_RESERVE_BYTES: u64 = 4 << 30;
 const SSD_MIN_FREE_BYTES: u64 = 20 << 30;
 const SSD_MAX_BYTES: u64 = 512 << 30;
 const STEP_BYTES: u64 = 512 << 20;
-/// below this measured read speed the model file's medium counts as slow (HDD, network, SATA behind NVMe)
-pub const SLOW_READ_MB_S: f64 = 1000.0;
+/// below this measured read speed the model file's medium counts as slow (HDD, network share)
+pub const SLOW_READ_MB_S: f64 = 300.0;
+/// the page-cache warm set is walked again this often (the kernel may have evicted pages meanwhile)
+const REWARM_SECS: u64 = 600;
 /// a planned move needs this much learned use, and a victim at most `MOVE_RATIO` of it
 const MOVE_MIN_SCORE: f64 = 8.0;
 const MOVE_RATIO: f64 = 0.5;
@@ -121,8 +123,11 @@ pub struct Tier {
     prefetch: OnceLock<Prefetch>,
     ssd: OnceLock<SsdBuffer>,
     stop: AtomicBool,
-    /// taken by the first model that sets tiering up in this process
+    /// taken by the first model that sets tiering up in this process, and by its CPU worker
     claimed: AtomicBool,
+    worker: AtomicBool,
+    /// requests running right now (a request is busy time as a whole, its prefill included)
+    active: AtomicU32,
     t0: std::time::Instant,
 }
 
@@ -132,6 +137,22 @@ static RESET: AtomicBool = AtomicBool::new(false);
 /// The process-wide tier state (created by `init`), or None when tiering is off for this run.
 pub fn global() -> Option<&'static Tier> {
     GLOBAL.get().copied()
+}
+
+/// The tier state for a CPU worker of a model with this shape: the first such worker only (a second model in the
+/// process, e.g. in a bench, counts nothing into the first one's usage).
+pub fn for_worker(nl: usize, ne: usize) -> Option<&'static Tier> {
+    global().filter(|t| t.nl == nl && t.ne == ne && !t.worker.swap(true, Ordering::AcqRel))
+}
+
+/// A request in flight; dropping it marks the end of the busy time.
+pub struct Busy(&'static Tier);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.note_busy();
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// `--tier-reset`: forget this model's learned state and SSD buffer at the next load.
@@ -169,6 +190,8 @@ impl Tier {
             ssd: OnceLock::new(),
             stop: AtomicBool::new(false),
             claimed: AtomicBool::new(false),
+            worker: AtomicBool::new(false),
+            active: AtomicU32::new(0),
             t0: std::time::Instant::now(),
         }
     }
@@ -255,8 +278,16 @@ impl Tier {
         (self.t0.elapsed().as_micros() as u64).saturating_sub(self.last_busy_us.load(Ordering::Relaxed)) / 1000
     }
 
+    /// No request is running and none ran for `IDLE_MS`.
     pub fn is_idle(&self) -> bool {
-        self.idle_ms() >= IDLE_MS
+        self.active.load(Ordering::Acquire) == 0 && self.idle_ms() >= IDLE_MS
+    }
+
+    /// Marks a request as running until the returned guard is dropped.
+    pub fn busy(&'static self) -> Busy {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        self.note_busy();
+        Busy(self)
     }
 
     #[inline]
@@ -289,12 +320,19 @@ impl Tier {
 
     /// The SSD buffer's copy of an expert ([gate, up, down]), if it holds one.
     #[inline]
-    pub fn ssd_get(&self, l: usize, e: usize) -> Option<[&'static [u8]; 3]> {
+    pub fn ssd_get(&self, l: usize, e: usize) -> Option<[&[u8]; 3]> {
         self.ssd.get().and_then(|s| s.get(l * self.ne + e))
     }
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Run `bg` on its own thread until the returned handle is dropped.
+    pub fn spawn(bg: Background, m: &'static dyn ExpertBytes) -> Option<Thread> {
+        let tier = bg.tier;
+        let handle = std::thread::Builder::new().name("tier".into()).spawn(move || bg.run(m)).ok()?;
+        Some(Thread { tier, handle: Some(handle) })
     }
 
     fn snapshot_picks(&self) -> Vec<u32> {
@@ -303,6 +341,21 @@ impl Tier {
 
     fn hits(&self) -> [u64; 4] {
         [0, 1, 2, 3].map(|i| self.hits[i].load(Ordering::Relaxed))
+    }
+}
+
+/// The background thread; dropping it (with the model it reads) stops and joins the thread, which saves once more.
+pub struct Thread {
+    tier: &'static Tier,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        self.tier.stop();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -674,9 +727,10 @@ pub fn state_name(paths: &[PathBuf]) -> String {
     clean(&name)
 }
 
-fn state_dir() -> PathBuf {
+/// Where the state goes when the model's directory is not writable, in order of preference.
+fn state_dirs() -> Vec<PathBuf> {
     let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let cands: Vec<PathBuf> = [
+    [
         env("DSX_STATE_DIR"),
         env("XDG_STATE_HOME").map(|p| p.join("dsx")),
         env("HOME").map(|p| p.join(".local/state/dsx")),
@@ -684,7 +738,12 @@ fn state_dir() -> PathBuf {
     ]
     .into_iter()
     .flatten()
-    .collect();
+    .collect()
+}
+
+/// The first of `state_dirs` that can be created and written.
+fn state_dir() -> PathBuf {
+    let cands = state_dirs();
     for d in &cands {
         if std::fs::create_dir_all(d).is_ok() && writable(d) {
             return d.clone();
@@ -709,35 +768,38 @@ pub fn state_path(paths: &[PathBuf]) -> PathBuf {
     }
 }
 
-/// Where an earlier version (one model file, state directory only) kept it.
-pub fn legacy_state_path(paths: &[PathBuf]) -> Option<PathBuf> {
-    (paths.len() == 1).then(|| state_dir().join(format!("{}.tier.json", state_name(paths))))
+/// Every place the state of this model may be in (the model's directory was or was not writable at earlier starts).
+pub fn state_candidates(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let name = format!("{}.tier.json", state_name(paths));
+    paths.first().and_then(|p| p.parent()).map(|d| d.to_path_buf()).into_iter().chain(state_dirs()).map(|d| d.join(&name)).collect()
 }
 
-/// Read the state if it belongs to this model and shape; None otherwise (a new model starts fresh). Reads version 1
-/// (usage only) as well.
+fn prev_path(path: &Path) -> PathBuf {
+    path.with_extension("json.prev")
+}
+
+/// Read the state if it belongs to this model and shape; None otherwise (a new model starts fresh). An unreadable or
+/// foreign file falls back to the previous version.
 pub fn load(path: &Path, id: &str, nl: usize, ne: usize) -> Option<Saved> {
+    load_one(path, id, nl, ne).or_else(|| load_one(&prev_path(path), id, nl, ne))
+}
+
+fn load_one(path: &Path, id: &str, nl: usize, ne: usize) -> Option<Saved> {
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    if v["layers"].as_u64()? as usize != nl || v["experts"].as_u64()? as usize != ne {
+    if v["version"].as_u64()? != STATE_VERSION || v["model"]["id"].as_str()? != id || v["layers"].as_u64()? as usize != nl || v["experts"].as_u64()? as usize != ne {
         return None;
     }
-    let (model, usage) = match v["version"].as_u64()? {
-        1 => (v["model"].as_str()?.to_owned(), &v),
-        STATE_VERSION => (v["model"]["id"].as_str()?.to_owned(), &v["usage"]),
-        _ => return None,
-    };
-    if model != id {
-        return None;
-    }
-    let score: Vec<f64> = usage["score"].as_array()?.iter().map(|x| x.as_f64().unwrap_or(0.0).max(0.0)).collect();
+    let score: Vec<f64> = v["usage"]["score"].as_array()?.iter().map(|x| x.as_f64().unwrap_or(0.0).max(0.0)).collect();
     if score.len() != nl * ne {
         return None;
     }
     let obj = |k: &str| v.get(k).and_then(|x| x.as_object()).cloned().unwrap_or_default();
-    Some(Saved { learned: Learned { score, tokens: usage["tokens"].as_f64().unwrap_or(0.0).max(0.0) }, devices: obj("devices"), configs: obj("configs") })
+    let tokens = v["usage"]["tokens"].as_f64().unwrap_or(0.0).max(0.0);
+    Some(Saved { learned: Learned { score, tokens }, devices: obj("devices"), configs: obj("configs") })
 }
 
-/// Write the state atomically (temp file + rename); the previous version stays as `.prev` (rotation: two files).
+/// Write the state atomically: a temp file of this process, then a rename over the state. The state before that stays
+/// reachable as `.prev` (a hard link, else a copy), so there is a readable state at every instant.
 pub fn save(path: &Path, id: &str, files: &[String], nl: usize, ne: usize, s: &Saved, stats: serde_json::Value) -> std::io::Result<()> {
     let v = serde_json::json!({
         "version": STATE_VERSION,
@@ -746,21 +808,41 @@ pub fn save(path: &Path, id: &str, files: &[String], nl: usize, ne: usize, s: &S
         "usage": {"tokens": s.learned.tokens, "score": s.learned.score.iter().map(|x| (x * 1000.0).round() / 1000.0).collect::<Vec<_>>()},
         "devices": s.devices, "configs": s.configs, "stats": stats, "saved": now_secs(),
     });
-    // per-process temp name: two servers on the same model never write into one temp file
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    {
+    let written = (|| {
         let mut f = File::create(&tmp)?;
         f.write_all(serde_json::to_string(&v)?.as_bytes())?;
-        f.sync_data()?;
+        f.sync_data()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     if path.exists() {
-        let _ = std::fs::rename(path, path.with_extension("json.prev"));
+        let prev = prev_path(path);
+        let _ = std::fs::remove_file(&prev);
+        if std::fs::hard_link(path, &prev).is_err() {
+            let _ = std::fs::copy(path, &prev);
+        }
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
-/// `--tier-reset`: remove the state (and its previous version), the legacy state and the SSD buffer of this model.
-pub fn reset_files(state: &Path, legacy: Option<&Path>, name: &str) -> usize {
+/// Temp files a killed process left next to the state (`<state>.tmp.<pid>`).
+pub fn remove_stale_temps(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().map(|n| n.to_string_lossy().into_owned())) else { return };
+    let prefix = format!("{name}.tmp.");
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// `--tier-reset`: remove the state, its previous version and the SSD buffer of this model.
+pub fn reset_files(state: &Path, name: &str) -> usize {
     let mut n = 0;
     let mut rm = |p: PathBuf| {
         if std::fs::remove_file(&p).is_ok() {
@@ -768,11 +850,7 @@ pub fn reset_files(state: &Path, legacy: Option<&Path>, name: &str) -> usize {
         }
     };
     rm(state.to_path_buf());
-    rm(state.with_extension("json.prev"));
-    if let Some(l) = legacy {
-        rm(l.to_path_buf());
-        rm(l.with_extension("json.prev"));
-    }
+    rm(prev_path(state));
     for d in ssd_dirs() {
         rm(d.join(format!("{name}.ssd-buffer")));
         rm(d.join(format!("{name}.ssd-buffer.json")));
@@ -811,10 +889,40 @@ fn dev_parts(dev: u64) -> (u64, u64) {
     (major, minor)
 }
 
+/// The sysfs directory of the block device holding `path`: by its device number, else (btrfs, overlay and others
+/// report an anonymous device number) by the source of its mount in /proc/self/mountinfo.
+fn block_sysfs(path: &Path) -> Option<PathBuf> {
+    let (ma, mi) = dev_parts(std::fs::metadata(path).ok()?.dev());
+    if let Ok(p) = std::fs::canonicalize(format!("/sys/dev/block/{ma}:{mi}")) {
+        return Some(p);
+    }
+    let canon = std::fs::canonicalize(path).ok()?;
+    let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let src = mount_source(&info, &canon)?;
+    let dev = std::fs::canonicalize(src).ok()?;
+    std::fs::canonicalize(Path::new("/sys/class/block").join(dev.file_name()?)).ok()
+}
+
+/// The source (`/dev/…`) of the mount that holds `path`, from mountinfo text: the longest mount point that is a prefix
+/// of the path; the last such line wins (later mounts shadow earlier ones).
+fn mount_source(mountinfo: &str, path: &Path) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    for line in mountinfo.lines() {
+        let Some((left, right)) = line.split_once(" - ") else { continue };
+        let Some(point) = left.split(' ').nth(4) else { continue };
+        let Some(src) = right.split(' ').nth(1) else { continue };
+        // mountinfo escapes space, tab, newline and backslash as octal
+        let point = point.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\");
+        if src.starts_with("/dev/") && path.starts_with(&point) && best.as_ref().is_none_or(|b| point.len() >= b.0) {
+            best = Some((point.len(), src.to_owned()));
+        }
+    }
+    best.map(|b| b.1)
+}
+
 /// Whether the file lives on a rotational disk (HDD), from /sys; None if unknown.
 pub fn rotational(path: &Path) -> Option<bool> {
-    let (ma, mi) = dev_parts(std::fs::metadata(path).ok()?.dev());
-    let sys = std::fs::canonicalize(format!("/sys/dev/block/{ma}:{mi}")).ok()?;
+    let sys = block_sysfs(path)?;
     for d in sys.ancestors() {
         if let Ok(s) = std::fs::read_to_string(d.join("queue/rotational")) {
             return Some(s.trim() == "1");
@@ -823,8 +931,11 @@ pub fn rotational(path: &Path) -> Option<bool> {
     None
 }
 
-/// `disk:<major>:<minor>` of the device holding `path` (the key of its measurements).
+/// `disk:<block device>` of the device holding `path` (the key of its measurements), else `disk:<major>:<minor>`.
 pub fn disk_key(path: &Path) -> Option<String> {
+    if let Some(name) = block_sysfs(path).and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())) {
+        return Some(format!("disk:{name}"));
+    }
     let (ma, mi) = dev_parts(std::fs::metadata(path).ok()?.dev());
     Some(format!("disk:{ma}:{mi}"))
 }
@@ -877,6 +988,7 @@ struct StatVfs {
     spare: [i32; 6],
 }
 unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
     fn statvfs(path: *const std::ffi::c_char, buf: *mut StatVfs) -> i32;
     fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
 }
@@ -905,20 +1017,14 @@ pub fn ram_headroom() -> u64 {
 }
 
 const MADV_WILLNEED: i32 = 3;
-const MADV_DONTNEED: i32 = 4;
-
-fn advise(b: &[u8], advice: i32) {
-    if b.is_empty() {
-        return;
-    }
-    let p = b.as_ptr() as usize;
-    let start = p & !4095;
-    unsafe { madvise(start as *mut _, p + b.len() - start, advice) };
-}
 
 /// Fault the bytes into the page cache (one read per 4 KiB page); returns the bytes covered.
 pub fn touch(b: &[u8]) -> u64 {
-    advise(b, MADV_WILLNEED);
+    if !b.is_empty() {
+        let p = b.as_ptr() as usize;
+        let start = p & !4095;
+        unsafe { madvise(start as *mut _, p + b.len() - start, MADV_WILLNEED) };
+    }
     let mut acc = 0u8;
     for i in (0..b.len()).step_by(4096) {
         acc ^= unsafe { std::ptr::read_volatile(b.as_ptr().add(i)) };
@@ -930,11 +1036,12 @@ pub fn touch(b: &[u8]) -> u64 {
 // ------------------------------------------------------------------------------------------------ SSD buffer
 
 /// Copies of hot experts on an SSD when the model file sits on a slow medium. One preallocated (sparse) file,
-/// mapped once; entries are appended, written and synced before they become visible, and an index file names them
-/// so the buffer survives restarts. Entries are never rewritten while the process runs (readers hold no locks).
+/// mapped once and locked by the one process that uses it; entries are appended, written and synced before they
+/// become visible, and an index file names them so the buffer survives restarts. Entries are never rewritten
+/// (readers hold no locks); once full, it keeps what it holds.
 pub struct SsdBuffer {
     file: File,
-    map: &'static [u8],
+    map: memmap2::Mmap,
     path: PathBuf,
     index: PathBuf,
     cap: u64,
@@ -944,43 +1051,57 @@ pub struct SsdBuffer {
     lens: Vec<[u32; 3]>,
     entries: Mutex<Vec<(usize, u64)>>,
     id: String,
+    /// stop appending when the buffer's file system has less free space than this
+    min_free: u64,
 }
 
 impl SsdBuffer {
-    /// Open or create the buffer in `dir` for the model `id`; `lens` gives each expert's three blob sizes.
-    pub fn open(dir: &Path, id: &str, name: &str, lens: Vec<[u32; 3]>, cap: u64) -> std::io::Result<SsdBuffer> {
+    /// Open or create the buffer in `dir` for the model `id`; `lens` gives each expert's three blob sizes, `want` the
+    /// size asked for. A buffer of this model is kept with its entries and only ever grows (its size depends on free
+    /// space and on the placement, which differ between starts); another model's is discarded.
+    pub fn open(dir: &Path, id: &str, name: &str, lens: Vec<[u32; 3]>, want: u64) -> std::io::Result<SsdBuffer> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("{name}.ssd-buffer"));
         let index = dir.join(format!("{name}.ssd-buffer.json"));
         let mut entries: Vec<(usize, u64)> = vec![];
         let mut used = 0u64;
         let prior = std::fs::read(&index).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-        let reuse = prior.as_ref().is_some_and(|v| v["model"].as_str() == Some(id) && v["cap"].as_u64() == Some(cap))
-            && std::fs::metadata(&path).is_ok_and(|m| m.len() == cap);
+        let have = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let reuse = have > 0 && prior.as_ref().is_some_and(|v| v["model"].as_str() == Some(id));
+        let cap = if reuse { have.max(want) } else { want };
         if reuse {
             for x in prior.as_ref().unwrap()["entries"].as_array().into_iter().flatten() {
                 let (Some(i), Some(off)) = (x[0].as_u64(), x[1].as_u64()) else { continue };
                 let i = i as usize;
                 let Some(len) = lens.get(i).map(|l| l.iter().map(|&n| n as u64).sum::<u64>()) else { continue };
-                if off + len <= cap {
+                // entries are only listed after their bytes were synced; one beyond the file is from a damaged index
+                if off + len <= have && !entries.iter().any(|e: &(usize, u64)| e.0 == i) {
                     entries.push((i, off));
                     used = used.max(off + len);
                 }
             }
         }
-        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(!reuse).open(&path)?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
+        // one writer: a second server on this model reads the model file instead (two would overwrite each other's entries)
+        const LOCK_EX_NB: i32 = 2 | 4;
+        if unsafe { flock(std::os::fd::AsRawFd::as_raw_fd(&file), LOCK_EX_NB) } != 0 {
+            return Err(std::io::Error::other("in use by another dsx process"));
+        }
         if !reuse {
+            file.set_len(0)?;
+        }
+        if have != cap || !reuse {
             file.set_len(cap)?;
         }
-        let map: &'static memmap2::Mmap = Box::leak(Box::new(unsafe { memmap2::MmapOptions::new().len(cap as usize).map(&file)? }));
+        let map = unsafe { memmap2::MmapOptions::new().len(cap as usize).map(&file)? };
         let slot: Vec<AtomicU64> = (0..lens.len()).map(|_| AtomicU64::new(0)).collect();
         for &(i, off) in &entries {
             slot[i].store(off + 1, Ordering::Release);
         }
-        Ok(SsdBuffer { file, map: &map[..], path, index, cap, used: AtomicU64::new(used.next_multiple_of(4096)), slot, lens, entries: Mutex::new(entries), id: id.to_owned() })
+        Ok(SsdBuffer { file, map, path, index, cap, used: AtomicU64::new(used.next_multiple_of(4096)), slot, lens, entries: Mutex::new(entries), id: id.to_owned(), min_free: SSD_MIN_FREE_BYTES })
     }
 
-    pub fn get(&self, i: usize) -> Option<[&'static [u8]; 3]> {
+    pub fn get(&self, i: usize) -> Option<[&[u8]; 3]> {
         let off = self.slot.get(i)?.load(Ordering::Acquire);
         if off == 0 {
             return None;
@@ -1005,7 +1126,8 @@ impl SsdBuffer {
         }
         let len: u64 = parts.iter().map(|p| p.len() as u64).sum();
         let off = self.used();
-        if off + len > self.cap {
+        // full, or the disk filled up since the (sparse) file was sized: stop here
+        if off + len > self.cap || self.path.parent().and_then(free_bytes).is_some_and(|f| f < self.min_free) {
             return Ok(false);
         }
         let mut o = off;
@@ -1109,25 +1231,31 @@ impl Background {
         let now = now_secs();
         let passes = self.tier.passes.load(Ordering::Relaxed);
         let all = self.tier.all_passes.load(Ordering::Relaxed);
+        let round = |x: f64, digits: i32| (x * 10f64.powi(digits)).round() / 10f64.powi(digits);
+        // a record is written anew each time; a figure this run could not measure keeps its last value
+        fn record(old: Option<&serde_json::Value>, fields: Vec<(&str, Option<serde_json::Value>)>) -> serde_json::Value {
+            let mut m = serde_json::Map::new();
+            for (k, v) in fields {
+                if let Some(v) = v.or_else(|| old.and_then(|o| o.get(k)).cloned()) {
+                    m.insert(k.into(), v);
+                }
+            }
+            serde_json::Value::Object(m)
+        }
         if let Some(stores) = self.tier.stores.get() {
             let ms = self.tier.gpu_ms.lock().unwrap().clone();
-            for (i, s) in stores.iter().enumerate() {
-                let picks = self.tier.store_picks[i.min(MAX_STORES - 1)].load(Ordering::Relaxed) as f64;
-                let mut d = self.saved.devices.get(&s.uuid).and_then(|v| v.as_object().cloned()).unwrap_or_default();
-                d.remove("expert_us"); // per-pick cost of an earlier build: a layer's fixed cost made it meaningless
-                d.insert("name".into(), s.name.clone().into());
-                d.insert("link_gbs".into(), ((s.link_gbs * 10.0).round() / 10.0).into());
-                d.insert("seen".into(), now.into());
-                if let Some(&(sum, n)) = ms.get(i)
-                    && n >= 8
-                {
-                    // the GPU's expert kernels in one (sampled) layer of a decode token, ms
-                    d.insert("expert_layer_ms".into(), (((sum / n as f64) * 1000.0).round() / 1000.0).into());
-                }
-                if all > 0 {
-                    d.insert("picks_per_token".into(), ((picks / all as f64 * 10.0).round() / 10.0).into());
-                }
-                self.saved.devices.insert(s.uuid.clone(), serde_json::Value::Object(d));
+            for (i, s) in stores.iter().enumerate().take(MAX_STORES) {
+                let picks = self.tier.store_picks[i].load(Ordering::Relaxed) as f64;
+                // the GPU's expert kernels in one (sampled) layer of a decode token
+                let layer_ms = ms.get(i).filter(|x| x.1 >= 8).map(|&(sum, n)| round(sum / n as f64, 3).into());
+                let r = record(self.saved.devices.get(&s.uuid), vec![
+                    ("name", Some(s.name.clone().into())),
+                    ("link_gbs", Some(round(s.link_gbs, 1).into())),
+                    ("expert_layer_ms", layer_ms),
+                    ("picks_per_token", (all > 0).then(|| round(picks / all as f64, 1).into())),
+                    ("seen", Some(now.into())),
+                ]);
+                self.saved.devices.insert(s.uuid.clone(), r);
             }
         }
         if let (Some(k), Some(mbs)) = (&self.model_disk, self.model_read_mb_s) {
@@ -1136,24 +1264,18 @@ impl Background {
         if let Some(key) = self.config_key() {
             let busy = self.tier.busy_us.load(Ordering::Relaxed) as f64 / 1e6;
             let h = self.tier.hits();
-            let tot = h.iter().sum::<u64>().max(1) as f64;
-            let mut c = self.saved.configs.get(&key).and_then(|v| v.as_object().cloned()).unwrap_or_default();
-            if passes >= 100 && busy > 0.0 {
-                c.insert("decode_tok_s".into(), ((passes as f64 / busy * 100.0).round() / 100.0).into());
-            }
-            c.insert("share_from_file".into(), (((h[3] as f64 / tot) * 1000.0).round() / 1000.0).into());
+            let tot = h.iter().sum::<u64>();
             let w = self.tier.waits();
-            if w.ready() {
-                let n = self.tier.stores.get().map_or(0, |s| s.len().saturating_sub(1));
-                c.insert("wait_for_cpu_us".into(), w.cpu_us.round().into());
-                c.insert("wait_for_aux_us".into(), w.aux_us[..n.min(MAX_STORES)].iter().map(|x| x.round()).collect::<Vec<_>>().into());
-            }
-            let cpu = h[1] + h[2] + h[3];
-            if all > 0 {
-                c.insert("cpu_picks_per_token".into(), ((cpu as f64 / all as f64 * 100.0).round() / 100.0).into());
-            }
-            c.insert("seen".into(), now.into());
-            self.saved.configs.insert(key, serde_json::Value::Object(c));
+            let aux = self.tier.stores.get().map_or(0, |s| s.len().saturating_sub(1)).min(MAX_STORES);
+            let r = record(self.saved.configs.get(&key), vec![
+                ("decode_tok_s", (passes >= 100 && busy > 0.0).then(|| round(passes as f64 / busy, 2).into())),
+                ("cpu_picks_per_token", (all > 0).then(|| round((h[1] + h[2] + h[3]) as f64 / all as f64, 2).into())),
+                ("share_from_file", (tot > 0).then(|| round(h[3] as f64 / tot as f64, 3).into())),
+                ("wait_for_cpu_us", w.ready().then(|| w.cpu_us.round().into())),
+                ("wait_for_aux_us", w.ready().then(|| w.aux_us[..aux].iter().map(|x| x.round()).collect::<Vec<_>>().into())),
+                ("seen", Some(now.into())),
+            ]);
+            self.saved.configs.insert(key, r);
         }
         self.saved.rotate(now);
     }
@@ -1174,7 +1296,7 @@ impl Background {
             "wait_for_aux_us": self.tier.waits().aux_total_us().round(),
             "wait_samples": self.tier.waits().samples,
             "page_cache_warm_gb": (st.warm_bytes as f64 / 1e9 * 10.0).round() / 10.0,
-            "model_read_mb_s": self.model_read_mb_s.map(f64::round).or(rate(st.warm_bytes, st.warm_secs)),
+            "model_read_mb_s": self.model_read_mb_s.map(f64::round),
             "ssd_buffer": self.tier.ssd.get().map(|s| serde_json::json!({"path": s.path(), "used_gb": (s.used() as f64 / 1e9 * 10.0).round() / 10.0,
                                                                          "write_mb_s": rate(st.ssd_bytes, st.ssd_secs)})),
             "slow_media": self.slow_media,
@@ -1258,12 +1380,7 @@ impl Background {
                 }
                 let p = m.parts(l, e);
                 match ssd.put(i, p) {
-                    Ok(true) => {
-                        copied += p.iter().map(|b| b.len() as u64).sum::<u64>();
-                        for b in p {
-                            advise(b, MADV_DONTNEED); // the slow medium's pages are no longer needed in RAM
-                        }
-                    }
+                    Ok(true) => copied += p.iter().map(|b| b.len() as u64).sum::<u64>(),
                     _ => break,
                 }
             }
@@ -1284,12 +1401,14 @@ impl Background {
     }
 
     /// The loop, every 200 ms: prefetch run-time moves; every 10 s fold usage; while idle (a 2 s pause) warm the page
-    /// cache and extend the SSD buffer; every 2 min save (busy or not), every 10 min log the figures.
+    /// cache and extend the SSD buffer; every 2 min save (busy or not), every 10 min log the figures. Ends, with a
+    /// last save, when the tier is stopped (the model is dropped).
     pub fn run(mut self, m: &'static dyn ExpertBytes) {
         let mut last = self.tier.snapshot_picks();
         let mut st = Stats::default();
         let mut warmed = std::collections::HashSet::new();
         let (mut last_save, mut last_fold, mut last_report) = (std::time::Instant::now(), std::time::Instant::now(), std::time::Instant::now());
+        let mut last_rewarm = std::time::Instant::now();
         let mut dirty = false;
         while !self.tier.stop.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
@@ -1304,6 +1423,13 @@ impl Background {
                 }
             }
             st.moves_planned += self.prefetch_moves(m) as u64;
+            if last_rewarm.elapsed().as_secs() >= REWARM_SECS {
+                // walk the warm set again from the hottest: pages still cached cost nothing, evicted ones come back
+                last_rewarm = std::time::Instant::now();
+                warmed.clear();
+                st.warm_bytes = 0;
+                st.warm_secs = 0.0;
+            }
             if self.tier.is_idle() {
                 self.idle_step(m, &mut st, &mut warmed);
             }
@@ -1382,29 +1508,64 @@ mod tests {
     }
 
     #[test]
-    fn state_roundtrip_rotation_identity_and_version1() {
+    fn state_roundtrip_previous_version_and_identity() {
         let d = std::env::temp_dir().join(format!("dsx-tier-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("m.tier.json");
         let mut s = Saved::new(6);
         s.learned.score[3] = 2.5;
         s.learned.tokens = 7.0;
-        s.devices.insert("GPU-a".into(), serde_json::json!({"name": "x", "expert_us": 40.0, "seen": now_secs()}));
+        s.devices.insert("GPU-a".into(), serde_json::json!({"name": "x", "seen": now_secs()}));
         save(&p, "id-a", &["m.gguf".into()], 2, 3, &s, serde_json::json!({})).unwrap();
-        save(&p, "id-a", &["m.gguf".into()], 2, 3, &s, serde_json::json!({})).unwrap();
-        assert!(p.with_extension("json.prev").exists());
-        assert_eq!(load(&p, "id-a", 2, 3), Some(s.clone()));
-        assert_eq!(load(&p, "id-b", 2, 3), None);
-        assert_eq!(load(&p, "id-a", 3, 3), None);
+        let mut newer = s.clone();
+        newer.learned.tokens = 9.0;
+        save(&p, "id-a", &["m.gguf".into()], 2, 3, &newer, serde_json::json!({})).unwrap();
+        assert_eq!(load(&p, "id-a", 2, 3), Some(newer));
+        assert_eq!(load(&p, "id-b", 2, 3), None, "another model");
+        assert_eq!(load(&p, "id-a", 3, 3), None, "another shape");
+        // a damaged or missing state falls back to the previous version
         std::fs::write(&p, b"{broken").unwrap();
-        assert_eq!(load(&p, "id-a", 2, 3), None);
-        // a version-1 file (usage only) is read
-        std::fs::write(&p, serde_json::to_vec(&serde_json::json!({"version": 1, "model": "id-a", "layers": 2, "experts": 3, "tokens": 5.0, "score": [0, 1, 2, 3, 4, 5]})).unwrap()).unwrap();
-        let v1 = load(&p, "id-a", 2, 3).unwrap();
-        assert_eq!(v1.learned.tokens, 5.0);
-        assert_eq!(v1.learned.score[5], 5.0);
-        assert!(v1.devices.is_empty());
+        assert_eq!(load(&p, "id-a", 2, 3), Some(s.clone()));
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(load(&p, "id-a", 2, 3), Some(s));
+        // odd values in a hand-edited file do not get in
+        std::fs::write(&p, br#"{"version":2,"model":{"id":"id-a"},"layers":1,"experts":2,"usage":{"tokens":"x","score":["y",-3]}}"#).unwrap();
+        let odd = load_one(&p, "id-a", 1, 2).unwrap();
+        assert_eq!((odd.learned.tokens, odd.learned.score), (0.0, vec![0.0, 0.0]));
+        // temp files of killed processes are removed, the state stays
+        std::fs::write(d.join("m.tier.json.tmp.1"), b"x").unwrap();
+        remove_stale_temps(&p);
+        assert!(!d.join("m.tier.json.tmp.1").exists() && p.exists());
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn mount_source_takes_the_longest_mount_point() {
+        let info = "36 1 0:31 /root / rw - btrfs /dev/nvme0n1p3 rw\n\
+                    40 36 0:35 /home /home rw - btrfs /dev/nvme0n1p3 rw\n\
+                    55 36 8:17 / /mnt/daten rw - ext4 /dev/sdb1 rw\n\
+                    60 36 0:50 / /mnt/my\\040disk rw - btrfs /dev/sdc1 rw\n\
+                    70 36 0:60 / /proc rw - proc proc rw\n";
+        let src = |p: &str| mount_source(info, Path::new(p));
+        assert_eq!(src("/mnt/daten/models/m.gguf").as_deref(), Some("/dev/sdb1"));
+        assert_eq!(src("/home/u/m.gguf").as_deref(), Some("/dev/nvme0n1p3"));
+        assert_eq!(src("/mnt/datenbank/m.gguf").as_deref(), Some("/dev/nvme0n1p3"), "a path prefix is not a name prefix");
+        assert_eq!(src("/mnt/my disk/m.gguf").as_deref(), Some("/dev/sdc1"));
+    }
+
+    #[test]
+    fn requests_and_pauses_decide_idleness() {
+        let t: &'static Tier = Box::leak(Box::new(Tier::new(1, 1)));
+        t.last_busy_us.store(0, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let far = t.t0.elapsed().as_micros() as u64 + IDLE_MS * 1000;
+        let idle_at = |now: u64| t.active.load(Ordering::Relaxed) == 0 && (now - t.last_busy_us.load(Ordering::Relaxed)) / 1000 >= IDLE_MS;
+        assert!(idle_at(far));
+        let b = t.busy();
+        assert!(!t.is_idle() && !idle_at(far), "a running request is busy however long it takes");
+        drop(b);
+        assert!(!t.is_idle(), "the pause starts when the request ends");
+        assert_eq!(t.active.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1444,7 +1605,7 @@ mod tests {
         let st = d.join("m.gguf.tier.json");
         std::fs::write(&st, b"{}").unwrap();
         std::fs::write(st.with_extension("json.prev"), b"{}").unwrap();
-        assert_eq!(reset_files(&st, None, "m.gguf-not-buffered"), 2);
+        assert_eq!(reset_files(&st, "m.gguf-not-buffered"), 2);
         assert!(!st.exists());
         request_reset();
         assert!(reset_requested());
@@ -1457,6 +1618,7 @@ mod tests {
         assert!(!t.claim(3, 8), "other shape");
         assert!(t.claim(2, 8));
         assert!(!t.claim(2, 8), "second model");
+        assert!(!t.worker.swap(true, Ordering::AcqRel) && t.worker.load(Ordering::Relaxed), "one worker only");
     }
 
     #[test]
@@ -1587,12 +1749,17 @@ mod tests {
     }
 
     #[test]
-    fn ssd_buffer_put_get_persist_and_refuse_when_full() {
+    fn ssd_buffer_put_get_persist_grow_and_refuse_when_full() {
         let d = std::env::temp_dir().join(format!("dsx-ssd-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let lens = vec![[100u32, 200, 4000]; 8];
         let fake = Fake((0..8).map(|i| vec![i as u8 + 1; 4300]).collect());
-        let b = SsdBuffer::open(&d, "id", "m.gguf", lens.clone(), 3 * 8192).unwrap(); // entries are 4 KiB aligned: 3 fit
+        let open = |id: &str, want: u64| {
+            let mut b = SsdBuffer::open(&d, id, "m.gguf", lens.clone(), want).unwrap();
+            b.min_free = 0;
+            b
+        };
+        let b = open("id", 3 * 8192); // entries are 4 KiB aligned: 3 fit
         assert!(b.get(5).is_none());
         assert!(b.put(5, fake.parts(1, 1)).unwrap());
         let g = b.get(5).unwrap();
@@ -1603,11 +1770,26 @@ mod tests {
         assert!(!b.put(4, fake.parts(1, 0)).unwrap(), "full");
         b.save_index().unwrap();
         drop(b);
-        let b2 = SsdBuffer::open(&d, "id", "m.gguf", lens.clone(), 3 * 8192).unwrap();
+        // the next start asks for less (other placement, less free space): the buffer and its entries stay
+        let b2 = open("id", 8192);
         assert!(b2.holds(5) && b2.holds(2) && !b2.holds(4));
         assert!(b2.get(2).unwrap()[0].iter().all(|&x| x == 3));
-        let b3 = SsdBuffer::open(&d, "other-model", "m.gguf", lens, 3 * 8192).unwrap();
-        assert!(!b3.holds(5), "another model starts empty");
+        assert!(!b2.put(4, fake.parts(1, 0)).unwrap(), "still full");
+        drop(b2);
+        // asked for more: it grows and keeps what it holds
+        let b3 = open("id", 5 * 8192);
+        assert!(b3.holds(5) && b3.put(4, fake.parts(1, 0)).unwrap());
+        assert!(b3.get(4).unwrap()[2].iter().all(|&x| x == 5));
+        // one process at a time: a second one gets no buffer (and reads the model file)
+        assert!(SsdBuffer::open(&d, "id", "m.gguf", lens.clone(), 5 * 8192).is_err());
+        drop(b3);
+        // too little free space left on the disk: nothing more is written
+        let mut low = open("id", 5 * 8192);
+        low.min_free = u64::MAX;
+        assert!(!low.put(6, fake.parts(1, 2)).unwrap());
+        drop(low);
+        let other = open("other-model", 3 * 8192);
+        assert!(!other.holds(5), "another model starts empty");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

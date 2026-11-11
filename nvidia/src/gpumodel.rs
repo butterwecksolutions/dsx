@@ -174,7 +174,11 @@ pub struct GpuModel<'m> {
     /// on_cpu flag changes from adapt_step, applied after the token's sync (the CPU worker may still be running the token)
     adapt_flags: Vec<(usize, bool)>,
     /// automatic tiering (tier.rs): fixed-set stores take run-time moves; moves in flight ((layer, expert), prefetch slot)
+    /// automatic tiering state when this model owns it (the first model of the process)
+    tier: Option<&'static crate::tier::Tier>,
     tier_swap: bool,
+    /// the background thread; stopped and joined when the model is dropped
+    tier_thread: Option<crate::tier::Thread>,
     tier_moves: Vec<((usize, usize), usize)>,
     pub tier_swaps: usize,
     /// decode tokens so far, and the layer whose expert kernels this token times (every tier::SAMPLE_EVERY tokens)
@@ -498,7 +502,9 @@ impl<'m> GpuModel<'m> {
             adapt_swaps: 0,
             adapt_s: 0.0,
             adapt_flags: vec![],
+            tier: None,
             tier_swap: false,
+            tier_thread: None,
             tier_moves: vec![],
             tier_swaps: 0,
             tier_tokens: 0,
@@ -622,18 +628,17 @@ impl<'m> GpuModel<'m> {
         };
         let tier_state = (!model_paths.is_empty())
             .then(|| (crate::tier::state_path(&model_paths), crate::tier::models_id(&model_paths), crate::tier::state_name(&model_paths)));
-        let legacy = crate::tier::legacy_state_path(&model_paths).filter(|l| tier_state.as_ref().is_none_or(|t| &t.0 != l));
+        let candidates = crate::tier::state_candidates(&model_paths);
         if crate::tier::reset_requested() {
-            if let Some((st, _, name)) = &tier_state {
-                let n = crate::tier::reset_files(st, legacy.as_deref(), name);
+            if let Some((_, _, name)) = &tier_state {
+                let n: usize = candidates.iter().map(|st| crate::tier::reset_files(st, name)).sum();
                 eprintln!("tier: reset ({n} files removed): starting from the shipped ranking");
             }
         }
+        // the state where it is written now, else where an earlier start (with other permissions) left it
         let saved = tier_state
             .as_ref()
-            .and_then(|(st, id, _)| {
-                crate::tier::load(st, id, c.n_layers, c.n_experts).or_else(|| legacy.as_ref().and_then(|l| crate::tier::load(l, id, c.n_layers, c.n_experts)))
-            })
+            .and_then(|(st, id, _)| std::iter::once(st).chain(&candidates).find_map(|p| crate::tier::load(p, id, c.n_layers, c.n_experts)))
             .unwrap_or_else(|| crate::tier::Saved::new(c.n_layers * c.n_experts));
         let learned = saved.learned.clone();
         let rank: Option<Vec<(usize, usize)>> = match &pl.rank {
@@ -775,6 +780,7 @@ impl<'m> GpuModel<'m> {
             // tiering state is per process: only the first model's shape gets it (a second model, e.g. in a bench, runs without)
             let tier_ok = tier.claim(c.n_layers, c.n_experts);
             if let (true, Some(path), Some((state, id, name))) = (tier_ok, model_paths.first().cloned(), tier_state.clone()) {
+                gm.tier = Some(tier);
                 let ne = c.n_experts;
                 // where every expert is computed from now: a GPU store, the arena, else the file side
                 for l in 0..c.n_layers {
@@ -848,8 +854,9 @@ impl<'m> GpuModel<'m> {
                     tier, state, id, files, top_k: c.top_k, saved,
                     model_disk: crate::tier::disk_key(&path), model_read_mb_s: read, slow_media: slow,
                 };
+                crate::tier::remove_stale_temps(&bg.state);
                 let mb: &'static ModelExperts = Box::leak(Box::new(ModelExperts(ms, arena)));
-                let _ = std::thread::Builder::new().name("tier".into()).spawn(move || bg.run(mb));
+                gm.tier_thread = crate::tier::Tier::spawn(bg, mb);
             }
             // adaptive residency starts from the calibration prior: each expert's expected decayed score (its share of
             // the calibration tokens per layer x 1 / (1 - decay)), so placed experts keep their slots until the live
@@ -1104,7 +1111,7 @@ impl<'m> GpuModel<'m> {
         // replacements in flight on any store, tiering's included
         let pending: std::collections::HashSet<(usize, usize)> =
             self.exp0.iter().flat_map(|s| s.pending()).chain(self.aux.iter().flat_map(|a| a.exp.pending())).collect();
-        let tier = crate::tier::global();
+        let tier = self.tier;
         let flags = &mut self.adapt_flags;
         let mut stores: Vec<(&Gpu, &mut crate::experts::GpuExperts)> =
             self.exp0.as_mut().map(|s| (&self.g, s)).into_iter().chain(self.aux.iter_mut().filter(|a| a.adaptive).map(|a| (&a.g, &mut a.exp))).collect();
@@ -1184,7 +1191,7 @@ impl<'m> GpuModel<'m> {
     fn commit_swaps(&mut self, all: bool) -> Result<()> {
         let ne = self.m.cfg.n_experts;
         let Some(w) = self.worker.as_ref() else { return Ok(()) };
-        let tier = crate::tier::global();
+        let tier = self.tier;
         let mut done: Vec<(usize, usize, usize)> = vec![];
         if let Some(s) = self.exp0.as_mut() {
             for (l, e) in s.commit_ready(&self.g, all)? {
@@ -1223,7 +1230,7 @@ impl<'m> GpuModel<'m> {
     ///   slot there. Both leave their tables before either copy starts, so no expert is ever resident on two GPUs; until
     ///   their copies land, the CPU computes both.
     fn tier_step(&mut self) -> Result<bool> {
-        let (Some(t), Some(w)) = (crate::tier::global(), self.worker.as_ref()) else { return Ok(false) };
+        let (Some(t), Some(w)) = (self.tier, self.worker.as_ref()) else { return Ok(false) };
         let Some(pf) = t.prefetch() else { return Ok(false) };
         let Some((slot, mv)) = pf.take() else { return Ok(false) };
         let m = self.m;
@@ -1290,7 +1297,7 @@ impl<'m> GpuModel<'m> {
     /// finished copies and starts the next prefetched move (at most one in flight per store); no token runs, so the
     /// victim's CPU flag is set at once. Returns true while moves remain (the caller comes back at once).
     pub fn tier_idle(&mut self) -> Result<bool> {
-        let Some(t) = crate::tier::global() else { return Ok(false) };
+        let Some(t) = self.tier else { return Ok(false) };
         if !self.tier_swap || !t.is_idle() {
             return Ok(false);
         }
@@ -1316,7 +1323,7 @@ impl<'m> GpuModel<'m> {
     }
 
     fn tier_collect_inner(&mut self) -> Result<()> {
-        let Some(t) = crate::tier::global() else { return Ok(()) };
+        let Some(t) = self.tier else { return Ok(()) };
         if let Some([a, b]) = self.tev0 {
             if self.g.done(b)? {
                 t.note_gpu_ms(0, self.g.elapsed_ms(a, b)? as f64);
@@ -2033,7 +2040,7 @@ impl<'m> GpuModel<'m> {
         let early = adapt_early();
         // tiering: time one layer's expert kernels every SAMPLE_EVERY tokens
         self.tier_tokens += 1;
-        self.tier_sample = (crate::tier::global().is_some() && self.tier_tokens % crate::tier::SAMPLE_EVERY == 0)
+        self.tier_sample = (self.tier.is_some() && self.tier_tokens % crate::tier::SAMPLE_EVERY == 0)
             .then_some((self.tier_tokens / crate::tier::SAMPLE_EVERY) as usize % self.m.cfg.n_layers);
         let r = self.step_inner(token).and_then(|()| {
             let t = std::time::Instant::now();

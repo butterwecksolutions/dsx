@@ -329,16 +329,9 @@ impl Real {
 
 impl Engine for Real {
     fn generate(&mut self, prompt: &[u32], p: &GenParams, emit: &mut dyn FnMut(u32) -> bool) -> Result<Finish> {
-        // tiering: a request (its prefill too) is busy time; background copies and warming wait
-        let tier = crate::tier::global();
-        if let Some(t) = tier {
-            t.note_busy();
-        }
-        let r = if self.multi.is_some() { self.generate_multi(prompt, p, emit) } else { self.generate_single(prompt, p, emit) };
-        if let Some(t) = tier {
-            t.note_busy();
-        }
-        r
+        // tiering: a request (its prefill too) is busy time; background copies and warming wait until it is over
+        let _busy = crate::tier::global().map(|t| t.busy());
+        if self.multi.is_some() { self.generate_multi(prompt, p, emit) } else { self.generate_single(prompt, p, emit) }
     }
 
     fn idle(&mut self) -> bool {
