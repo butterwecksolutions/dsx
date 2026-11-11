@@ -795,6 +795,7 @@ impl<'m> GpuModel<'m> {
                             crate::tier::LOC_FILE
                         };
                         tier.set_loc(l, e, loc);
+                        tier.set_in_arena(l, e, arena.is_some_and(|a| a.get(l, e).is_some()));
                     }
                 }
                 // experts swap only within the same quant types
@@ -855,7 +856,7 @@ impl<'m> GpuModel<'m> {
                     model_disk: crate::tier::disk_key(&path), model_read_mb_s: read, slow_media: slow,
                 };
                 crate::tier::remove_stale_temps(&bg.state);
-                let mb: &'static ModelExperts = Box::leak(Box::new(ModelExperts(ms)));
+                let mb: &'static ModelExperts = Box::leak(Box::new(ModelExperts(ms, arena)));
                 gm.tier_thread = crate::tier::Tier::spawn(bg, mb);
             }
             // adaptive residency starts from the calibration prior: each expert's expected decayed score (its share of
@@ -1246,9 +1247,14 @@ impl<'m> GpuModel<'m> {
         let side = |(l, e): (usize, usize)| if self.arena.is_some_and(|a| a.get(l, e).is_some()) { crate::tier::LOC_ARENA } else { crate::tier::LOC_FILE };
         let (loc_new, loc_victim) = (side((l, e)), side((vl, ve)));
         if mv.store == crate::tier::TO_ARENA {
-            // both are the CPU's, on no GPU and in no copy; then nothing reads the arena in a pause once the streams are done
-            let ok = idle && !busy && on_cpu(l, e) && on_cpu(vl, ve) && !self.resident(l, e) && !self.resident(vl, ve)
-                && loc_new == crate::tier::LOC_FILE && loc_victim == crate::tier::LOC_ARENA;
+            // the new expert is the CPU's without an arena copy; the victim's copy is either read by the CPU (it computes the
+            // victim) or by nobody (the victim is resident on a fixed-set store; an adaptive store's residents keep theirs).
+            // Nothing is in a copy, and once the streams are done nothing reads the arena in a pause.
+            let victim_ok = (on_cpu(vl, ve) && !self.resident(vl, ve))
+                || (self.exp0.as_ref().is_some_and(|s| s.has(vl, ve)) && self.adapt == 0)
+                || self.aux.iter().any(|a| !a.adaptive && a.exp.has(vl, ve));
+            let ok = idle && !busy && on_cpu(l, e) && !self.resident(l, e) && loc_new == crate::tier::LOC_FILE && victim_ok
+                && self.arena.is_some_and(|a| a.get(vl, ve).is_some());
             let mut done = false;
             if let (true, Some(arena), Some(raw)) = (ok, self.arena, pf.parts(slot)) {
                 if fits(raw, x) {
@@ -1263,7 +1269,12 @@ impl<'m> GpuModel<'m> {
             }
             if done {
                 t.set_loc(l, e, crate::tier::LOC_ARENA);
-                t.set_loc(vl, ve, crate::tier::LOC_FILE);
+                t.set_in_arena(l, e, true);
+                t.set_in_arena(vl, ve, false);
+                if t.loc(vl * ne + ve) == crate::tier::LOC_ARENA {
+                    t.set_loc(vl, ve, crate::tier::LOC_FILE);
+                }
+                t.note_done(&mv);
                 self.tier_swaps += 1;
             }
             pf.release(slot);
@@ -1293,7 +1304,8 @@ impl<'m> GpuModel<'m> {
                 let (lo, hi) = stores.split_at_mut(src.max(mv.store));
                 let (a, b) = (&mut lo[src.min(mv.store)], &mut hi[0]);
                 let (from, to) = if src < mv.store { (a, b) } else { (b, a) };
-                if let (false, Some((gf, sf, _)), Some((gt, st, _)), Some(raw), Some(vraw)) = (busy, from.as_mut(), to.as_mut(), pf.parts(slot), pf.victim_parts(slot)) {
+                // only fixed-set stores: an adaptive one keeps an arena copy of each resident, which the incoming expert may lack
+                if let (false, Some((gf, sf, false)), Some((gt, st, false)), Some(raw), Some(vraw)) = (busy, from.as_mut(), to.as_mut(), pf.parts(slot), pf.victim_parts(slot)) {
                     let ready = sf.has(l, e) && st.has(vl, ve) && sf.swap_room() > 0 && st.swap_room() > 0
                         && sf.types(l, e) == Some(types) && st.types(vl, ve) == Some(types) && fits(raw, x) && fits(vraw, v);
                     if ready {
@@ -1316,6 +1328,7 @@ impl<'m> GpuModel<'m> {
             Some(_) => {}
         }
         if started {
+            t.note_done(&mv);
             self.tier_swaps += 1;
         } else {
             pf.release(slot);
@@ -2087,7 +2100,7 @@ impl<'m> GpuModel<'m> {
                     self.adapt_step()?;
                 }
             }
-            if self.tier_swap {
+            if self.tier_swap && self.tier_tokens % crate::tier::WORK_MOVE_EVERY == 0 {
                 self.tier_step(false)?;
             }
             self.tier_collect()?;
@@ -2886,13 +2899,19 @@ impl GpuModel<'_> {
     }
 }
 
-/// The model's expert bytes for the tiering thread: always the mapped file (the arena changes in pauses, on the engine
-/// thread; this thread never reads it).
-struct ModelExperts(&'static Model);
+/// The model's expert bytes for the tiering thread: from the arena when it holds them (read under its lock, so an
+/// arena move on the engine thread waits), else the mapped file.
+struct ModelExperts(&'static Model, Option<&'static crate::experts::Arena>);
 
 impl crate::tier::ExpertBytes for ModelExperts {
     fn parts(&self, l: usize, e: usize) -> [&[u8]; 3] {
         let x = &self.0.layers[l].experts[e];
         [x.gate.bytes(), x.up.bytes(), x.down.bytes()]
+    }
+
+    fn read(&self, l: usize, e: usize, f: &mut dyn FnMut([&[u8]; 3])) {
+        if !self.1.is_some_and(|a| a.read_locked(l, e, f)) {
+            f(self.parts(l, e))
+        }
     }
 }

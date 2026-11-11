@@ -918,6 +918,17 @@ impl Arena {
         Some([&b[s[0].0..s[0].0 + s[0].1], &b[s[1].0..s[1].0 + s[1].1], &b[s[2].0..s[2].0 + s[2].1]])
     }
 
+    /// Hand expert (l, e)'s bytes to `f` while `replace` is kept out (a reader on another thread than the engine's, e.g.
+    /// automatic tiering copying an expert ahead of a move, sees either the old or the new expert, never a mix).
+    /// False when the arena does not hold it.
+    pub fn read_locked(&self, l: usize, e: usize, f: &mut dyn FnMut([&[u8]; 3])) -> bool {
+        let slots = self.slots.read().unwrap();
+        let Some(s) = slots.get(&(l, e)) else { return false };
+        let b = self.buf.as_slice::<u8>();
+        f([&b[s[0].0..s[0].0 + s[0].1], &b[s[1].0..s[1].0 + s[1].1], &b[s[2].0..s[2].0 + s[2].1]]);
+        true
+    }
+
     /// experts held
     pub fn len(&self) -> usize {
         self.slots.read().unwrap().len()

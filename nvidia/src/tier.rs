@@ -9,12 +9,16 @@
 //!   depend on the hardware: one score serves every GPU combination the model is started with.
 //! * **Who is waited for.** Every 64th decode token one layer (rotating) is timed on the main GPU: after its own work
 //!   it waits for the CPU's experts, then for each aux GPU (`Waits`). The device that finishes last gets work taken
-//!   away: a late aux GPU exchanges its hottest experts for colder ones of a GPU that is not late (`plan_exchanges`); a
-//!   late CPU hands hot experts to fixed-set GPU stores that are not late (`plan_moves`).
-//! * **Arena.** In pauses, hot experts of the file side take the place of cold ones in the RAM arena (`plan_arena`,
-//!   `Arena::replace` on the engine thread), so what is in use ends up on GPUs and in RAM.
-//! * **Run time.** The plans' experts are copied into pinned prefetch slots by this thread; the engine starts them
-//!   between tokens (at most one per token) and in pauses back to back (`GpuModel::tier_step`, `tier_idle`), with the
+//!   away: a late aux GPU exchanges its hottest experts for colder ones of a fixed-set GPU that is not late
+//!   (`plan_exchanges`); a late CPU hands hot experts to fixed-set GPU stores that are not late (`plan_moves`).
+//!   Adaptive stores keep an arena copy of every resident (they hand experts back to the CPU at any token), so
+//!   nothing that may lack one is moved into them.
+//! * **Arena.** In pauses, experts the CPU reads from the file side take the place of arena copies nobody reads
+//!   (experts resident on fixed-set GPUs), then of cold ones (`plan_arena`, `Arena::replace` on the engine thread), so
+//!   what is in use ends up on GPUs and in RAM.
+//! * **Run time.** The plans' experts are copied into pinned prefetch slots by this thread (from RAM when it holds
+//!   them); the engine starts them while a request runs (at most one per `WORK_MOVE_EVERY` tokens) and in pauses
+//!   back to back (`GpuModel::tier_step`, `tier_idle`), with the
 //!   protocol of adaptive replacement: a victim leaves its table first and the CPU computes it meanwhile; a new expert
 //!   enters a table only after its copy completed. No expert is ever resident on two GPUs.
 //! * **Pauses.** In every pause of `IDLE_MS` (no request running) this thread also warms the page cache with the hottest
@@ -62,6 +66,8 @@ pub const PREFETCH_SLOTS: usize = 4;
 pub const MAX_STORES: usize = 9;
 /// one sample (expert kernels and the main GPU's waits, one layer, rotating) per this many decode tokens
 pub const SAMPLE_EVERY: u64 = 64;
+/// while a request runs, at most one move or exchange starts per this many decode tokens; pauses take the rest
+pub const WORK_MOVE_EVERY: u64 = 16;
 /// a measured wait counts as real above this (µs per layer); below it the device was not on the critical path
 const WAIT_US: f64 = 20.0;
 /// smoothing of the measured waits (weight of a new sample)
@@ -95,8 +101,16 @@ pub struct StoreInfo {
     pub link_gbs: f64,
     /// fixed set otherwise: tiering may move experts from the CPU into it at run time
     pub tier_swaps: bool,
-    /// can replace experts at run time at all (adaptive, or taking tiering's moves): may take part in an exchange
+    /// can replace experts at run time at all (adaptive, or taking tiering's moves)
     pub swaps: bool,
+}
+
+impl StoreInfo {
+    /// Replaces experts by recent use on its own (DSX_ADAPT). Its residents must keep their arena copies (it hands them
+    /// back to the CPU at any token), so tiering moves nothing into it and leaves its arena copies alone.
+    pub fn adaptive(&self) -> bool {
+        self.swaps && !self.tier_swaps
+    }
 }
 
 pub struct Tier {
@@ -119,6 +133,8 @@ pub struct Tier {
     busy_us: AtomicU64,
     last_pass_us: AtomicU64,
     loc: Vec<AtomicU8>,
+    /// per expert: whether the RAM arena holds a copy (it may also be resident on a GPU)
+    in_arena: Vec<AtomicBool>,
     /// per expert: its (gate/up, down) quant types folded into one key; experts swap only with the same key
     key: OnceLock<Vec<u32>>,
     stores: OnceLock<Vec<StoreInfo>>,
@@ -130,6 +146,8 @@ pub struct Tier {
     worker: AtomicBool,
     /// requests running right now (a request is busy time as a whole, its prefill included)
     active: AtomicU32,
+    /// moves carried out: from the CPU onto a GPU, between GPUs, into the arena
+    done: [AtomicU64; 3],
     t0: std::time::Instant,
 }
 
@@ -186,6 +204,7 @@ impl Tier {
             busy_us: AtomicU64::new(0),
             last_pass_us: AtomicU64::new(0),
             loc: (0..nl * ne).map(|_| AtomicU8::new(LOC_FILE)).collect(),
+            in_arena: (0..nl * ne).map(|_| AtomicBool::new(false)).collect(),
             key: OnceLock::new(),
             stores: OnceLock::new(),
             prefetch: OnceLock::new(),
@@ -194,6 +213,7 @@ impl Tier {
             claimed: AtomicBool::new(false),
             worker: AtomicBool::new(false),
             active: AtomicU32::new(0),
+            done: Default::default(),
             t0: std::time::Instant::now(),
         }
     }
@@ -285,6 +305,12 @@ impl Tier {
         self.active.load(Ordering::Acquire) == 0 && self.idle_ms() >= IDLE_MS
     }
 
+    /// A move the engine carried out (`Move::from` set: between GPUs; `store == TO_ARENA`: into the arena).
+    pub fn note_done(&self, mv: &Move) {
+        let k = if mv.store == TO_ARENA { 2 } else if mv.from.is_some() { 1 } else { 0 };
+        self.done[k].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Marks a request as running until the returned guard is dropped.
     pub fn busy(&'static self) -> Busy {
         self.active.fetch_add(1, Ordering::AcqRel);
@@ -302,6 +328,16 @@ impl Tier {
         if let Some(x) = self.loc.get(l * self.ne + e) {
             x.store(v, Ordering::Relaxed);
         }
+    }
+
+    pub fn set_in_arena(&self, l: usize, e: usize, v: bool) {
+        if let Some(x) = self.in_arena.get(l * self.ne + e) {
+            x.store(v, Ordering::Relaxed);
+        }
+    }
+
+    pub fn in_arena(&self, i: usize) -> bool {
+        self.in_arena.get(i).is_some_and(|x| x.load(Ordering::Relaxed))
     }
 
     pub fn set_keys(&self, keys: Vec<u32>) {
@@ -404,23 +440,44 @@ impl Prefetch {
         (0..self.state.len()).find(|&i| self.state[i].compare_exchange(SLOT_FREE, SLOT_FILLING, Ordering::AcqRel, Ordering::Relaxed).is_ok())
     }
 
-    /// Copy the expert (and, for an exchange, the victim) into a claimed slot and publish the move.
-    fn fill(&self, i: usize, mv: Move, parts: [&[u8]; 3], victim: Option<[&[u8]; 3]>) -> bool {
-        let lens = parts.map(|p| p.len() as u32);
-        let vlens = victim.map_or([0; 3], |v| v.map(|p| p.len() as u32));
-        let total: usize = lens.iter().chain(&vlens).map(|&n| n as usize).sum();
-        if total > self.cap {
-            self.state[i].store(SLOT_FREE, Ordering::Release);
-            return false;
+    /// Copy one expert into a claimed slot at byte `off`; its lengths, or None when it does not fit.
+    fn put(&self, i: usize, off: usize, parts: [&[u8]; 3]) -> Option<[u32; 3]> {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        if off + total > self.cap {
+            return None;
         }
-        let dst = unsafe { std::slice::from_raw_parts_mut((self.base + i * self.cap) as *mut u8, total) };
+        let dst = unsafe { std::slice::from_raw_parts_mut((self.base + i * self.cap + off) as *mut u8, total) };
         let mut o = 0;
-        for p in parts.into_iter().chain(victim.into_iter().flatten()) {
+        for p in parts {
             dst[o..o + p.len()].copy_from_slice(p);
             o += p.len();
         }
+        Some(parts.map(|p| p.len() as u32))
+    }
+
+    /// Publish a claimed slot whose expert(s) `put` wrote.
+    fn publish(&self, i: usize, mv: Move, lens: [u32; 3], vlens: [u32; 3]) {
         *self.mv[i].lock().unwrap() = Some((mv, lens, vlens));
         self.state[i].store(SLOT_READY, Ordering::Release);
+    }
+
+    /// Copy the expert (and, for an exchange, the victim) into a claimed slot and publish the move.
+    #[cfg(test)]
+    fn fill(&self, i: usize, mv: Move, parts: [&[u8]; 3], victim: Option<[&[u8]; 3]>) -> bool {
+        let Some(lens) = self.put(i, 0, parts) else {
+            self.unclaim(i);
+            return false;
+        };
+        let off = lens.iter().map(|&n| n as usize).sum();
+        let vlens = match victim.map(|v| self.put(i, off, v)) {
+            None => [0; 3],
+            Some(Some(v)) => v,
+            Some(None) => {
+                self.unclaim(i);
+                return false;
+            }
+        };
+        self.publish(i, mv, lens, vlens);
         true
     }
 
@@ -535,12 +592,12 @@ pub fn plan_moves(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[S
 /// Plan up to `room` exchanges that take work off GPUs finishing last (`late`, store indices) onto GPUs that do not
 /// (`early`: the main GPU, which waits for the others, and aux GPUs it does not wait for): the hottest expert of a late
 /// store swaps places with the coldest resident of the same key in an early store, if that one has at most `MOVE_RATIO`
-/// of its score. Both stores stay full; the late one keeps a colder expert. Both must be able to replace experts at
-/// run time.
+/// of its score. Both stores stay full; the late one keeps a colder expert. Only fixed-set stores take part: an adaptive
+/// store keeps an arena copy of every resident, which an expert coming from another GPU does not have.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[StoreInfo], late: &[usize], early: &[usize], busy: &[Move], room: usize) -> Vec<Move> {
     let ne = ne.max(1);
-    let can = |i: usize| stores.get(i).is_some_and(|s| s.swaps);
+    let can = |i: usize| stores.get(i).is_some_and(|s| s.tier_swaps);
     let late: Vec<usize> = late.iter().copied().filter(|&i| can(i)).collect();
     let early: Vec<usize> = early.iter().copied().filter(|&i| can(i) && !late.contains(&i)).collect();
     if room == 0 || late.is_empty() || early.is_empty() {
@@ -586,23 +643,33 @@ pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores:
     out
 }
 
-/// Plan up to `room` moves into the RAM arena: the hottest experts the CPU reads from the file side against the
-/// coldest ones it reads from the arena, same key (so the same byte lengths), a victim at most `MOVE_RATIO` of the
-/// candidate's score.
-pub fn plan_arena(ne: usize, score: &[f64], loc: &[u8], key: &[u32], busy: &[Move], room: usize) -> Vec<Move> {
+/// Plan up to `room` moves into the RAM arena. Candidates: experts the CPU computes without an arena copy (it reads
+/// them from the file side), hottest first. Victims, same key (so the same byte lengths): first arena copies of experts
+/// resident on a fixed-set GPU store (the CPU never reads them; an adaptive store's residents keep theirs, since that
+/// store may hand them back to the CPU at any token), then the coldest experts the CPU reads from the arena, at most
+/// `MOVE_RATIO` of the candidate's score. `in_arena` per expert; `adaptive` per store.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_arena(ne: usize, score: &[f64], loc: &[u8], key: &[u32], in_arena: &[bool], adaptive: &[bool], busy: &[Move], room: usize) -> Vec<Move> {
     let ne = ne.max(1);
     let mut off: std::collections::HashSet<usize> = busy.iter().flat_map(|m| [m.new, m.victim]).map(|(l, e)| l * ne + e).collect();
-    let mut cold: HashMap<u32, Vec<(f64, usize)>> = HashMap::new();
+    // per key: (wasted?, score, index), the best victim last
+    let mut victims: HashMap<u32, Vec<(bool, f64, usize)>> = HashMap::new();
     let mut hot: Vec<(f64, usize)> = vec![];
     for i in 0..score.len() {
-        match loc[i] {
-            LOC_ARENA => cold.entry(key[i]).or_default().push((score[i], i)),
-            LOC_FILE if score[i] >= MOVE_MIN_SCORE => hot.push((score[i], i)),
-            _ => {}
+        let gpu = loc[i].checked_sub(LOC_GPU).map(usize::from);
+        if in_arena[i] {
+            match gpu {
+                Some(st) if !adaptive.get(st).copied().unwrap_or(true) => victims.entry(key[i]).or_default().push((true, score[i], i)),
+                None => victims.entry(key[i]).or_default().push((false, score[i], i)),
+                Some(_) => {}
+            }
+        } else if gpu.is_none() {
+            hot.push((score[i], i));
         }
     }
-    for v in cold.values_mut() {
-        v.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for v in victims.values_mut() {
+        // wasted copies last (taken first), then by score, coldest last
+        v.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
     }
     hot.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut out = vec![];
@@ -613,12 +680,13 @@ pub fn plan_arena(ne: usize, score: &[f64], loc: &[u8], key: &[u32], busy: &[Mov
         if off.contains(&i) {
             continue;
         }
-        let Some(list) = cold.get_mut(&key[i]) else { continue };
-        while list.last().is_some_and(|x| off.contains(&x.1)) {
+        let Some(list) = victims.get_mut(&key[i]) else { continue };
+        while list.last().is_some_and(|x| off.contains(&x.2)) {
             list.pop();
         }
-        let Some(&(vs, vi)) = list.last() else { continue };
-        if vs > sc * MOVE_RATIO {
+        let Some(&(wasted, vs, vi)) = list.last() else { continue };
+        // a wasted copy makes room for any expert the CPU reads from disk; a used one only for a clearly hotter one
+        if !wasted && (sc < MOVE_MIN_SCORE || vs > sc * MOVE_RATIO) {
             continue;
         }
         list.pop();
@@ -1246,9 +1314,14 @@ pub fn ssd_dir(model: &Path) -> Option<PathBuf> {
 
 // ------------------------------------------------------------------------------------------------ background work
 
-/// What the background thread needs from the model: each expert's three byte slices (where the CPU would read them).
+/// What the background thread needs from the model.
 pub trait ExpertBytes: Sync {
+    /// An expert's three byte slices in the mapped model file.
     fn parts(&self, l: usize, e: usize) -> [&[u8]; 3];
+    /// Hand the expert's bytes to `f` from RAM when possible (the arena, read under its lock), else from the file.
+    fn read(&self, l: usize, e: usize, f: &mut dyn FnMut([&[u8]; 3])) {
+        f(self.parts(l, e))
+    }
 }
 
 pub struct Background {
@@ -1354,6 +1427,8 @@ impl Background {
             "experts_on_gpus": on_gpu,
             "file_side_experts": (0..self.tier.nl * ne).filter(|&i| self.tier.loc(i) == LOC_FILE).count(),
             "moves_planned": st.moves_planned,
+            "moves_done": {"cpu_to_gpu": self.tier.done[0].load(Ordering::Relaxed), "between_gpus": self.tier.done[1].load(Ordering::Relaxed),
+                           "file_to_ram": self.tier.done[2].load(Ordering::Relaxed)},
             "wait_for_cpu_us": self.tier.waits().cpu_us.round(),
             "wait_for_aux_us": self.tier.waits().aux_total_us().round(),
             "wait_samples": self.tier.waits().samples,
@@ -1390,17 +1465,38 @@ impl Background {
         // the arena follows use in pauses: hot experts of the file side take the place of cold ones in it
         let arena_busy = busy.iter().filter(|m| m.store == TO_ARENA).count();
         if self.tier.is_idle() && arena_busy < ARENA_SLOTS {
-            let more = plan_arena(ne, score, &loc, key, &busy, (free - moves.len()).min(ARENA_SLOTS - arena_busy));
+            let in_arena: Vec<bool> = (0..self.tier.nl * ne).map(|i| self.tier.in_arena(i)).collect();
+            let adaptive: Vec<bool> = stores.iter().map(|s| s.adaptive()).collect();
+            let more = plan_arena(ne, score, &loc, key, &in_arena, &adaptive, &busy, (free - moves.len()).min(ARENA_SLOTS - arena_busy));
             moves.extend(more);
         }
         let mut n = 0;
         for mv in moves {
             let Some(i) = pf.claim() else { break };
-            let bytes = |(l, e): (usize, usize)| self.tier.ssd_get(l, e).unwrap_or_else(|| m.parts(l, e));
-            if pf.fill(i, mv, bytes(mv.new), mv.from.map(|_| bytes(mv.victim))) {
-                n += 1;
-            } else {
+            // the bytes come from RAM when it holds them (arena), else the SSD buffer, else the file: a move into the
+            // arena is the only one that has to read the file side
+            let copy = |(l, e): (usize, usize), off: usize| {
+                let mut got = None;
+                match self.tier.ssd_get(l, e) {
+                    Some(p) => got = pf.put(i, off, p),
+                    None => m.read(l, e, &mut |p| got = pf.put(i, off, p)),
+                }
+                got
+            };
+            let Some(lens) = copy(mv.new, 0) else {
                 pf.unclaim(i);
+                continue;
+            };
+            let vlens = match mv.from {
+                None => Some([0; 3]),
+                Some(_) => copy(mv.victim, lens.iter().map(|&n| n as usize).sum()),
+            };
+            match vlens {
+                Some(v) => {
+                    pf.publish(i, mv, lens, v);
+                    n += 1;
+                }
+                None => pf.unclaim(i),
             }
         }
         n
@@ -1764,7 +1860,7 @@ mod tests {
 
     #[test]
     fn exchanges_take_hot_experts_off_late_gpus_onto_the_main_one() {
-        let st = |swaps| StoreInfo { uuid: "u".into(), name: "n".into(), link_gbs: 1.0, tier_swaps: false, swaps };
+        let st = |fixed| StoreInfo { uuid: "u".into(), name: "n".into(), link_gbs: 1.0, tier_swaps: fixed, swaps: fixed };
         let stores = vec![st(true), st(true)];
         // 1 layer x 8: main holds 0 (cold), 1 (warm); aux holds 2 (hot), 3 (hotter), 4 (other key); 5 on the CPU
         let loc = [LOC_GPU, LOC_GPU, LOC_GPU + 1, LOC_GPU + 1, LOC_GPU + 1, LOC_ARENA, LOC_FILE, LOC_FILE];
@@ -1775,6 +1871,10 @@ mod tests {
         assert_eq!(m, vec![Move { new: (0, 3), store: 0, victim: (0, 0), from: Some(1) }]);
         assert!(plan_exchanges(8, &score, &loc, &key, &stores, &[], &[0, 1], &[], 4).is_empty(), "nothing late");
         assert!(plan_exchanges(8, &score, &loc, &key, &[st(false), st(true)], &[1], &[0], &[], 4).is_empty(), "main cannot swap");
+        // an adaptive store (swaps by itself, no tier moves) takes no expert from another GPU: it lacks an arena copy
+        let adaptive = StoreInfo { uuid: "u".into(), name: "n".into(), link_gbs: 1.0, tier_swaps: false, swaps: true };
+        assert!(adaptive.adaptive());
+        assert!(plan_exchanges(8, &score, &loc, &key, &[adaptive, st(true)], &[1], &[0], &[], 4).is_empty(), "main is adaptive");
         assert!(plan_exchanges(8, &score, &loc, &key, &stores, &[1], &[0], &m, 4).is_empty(), "in transit");
         // three GPUs of different kinds: the late one (2) hands its hottest to whichever early GPU holds the coldest
         let stores3 = vec![st(true), st(true), st(true)];
@@ -1790,11 +1890,22 @@ mod tests {
         let loc = [LOC_ARENA, LOC_ARENA, LOC_ARENA, LOC_FILE, LOC_FILE, LOC_GPU];
         let key = [1, 1, 2, 1, 1, 1];
         let score = [4.0, 30.0, 0.0, 50.0, 20.0, 99.0];
-        let m = plan_arena(6, &score, &loc, &key, &[], 4);
+        let in_arena = [true, true, true, false, false, false];
+        let m = plan_arena(6, &score, &loc, &key, &in_arena, &[true], &[], 4);
         // 50 takes the place of 4; 20 would need a victim of at most 10: 30 is too warm
         assert_eq!(m, vec![Move { new: (0, 3), store: TO_ARENA, victim: (0, 0), from: None }]);
-        assert!(plan_arena(6, &score, &loc, &key, &m, 4).is_empty(), "in transit");
-        assert!(plan_arena(6, &score, &[LOC_FILE; 6], &key, &[], 4).is_empty(), "no arena");
+        assert!(plan_arena(6, &score, &loc, &key, &in_arena, &[true], &m, 4).is_empty(), "in transit");
+        assert!(plan_arena(6, &score, &[LOC_FILE; 6], &key, &[false; 6], &[true], &[], 4).is_empty(), "no arena");
+        // 5 is resident on a store and still has an arena copy: on a fixed-set store nobody reads that copy, so it goes
+        // first, even for the lukewarm 4; on an adaptive store it stays (the store may hand 5 back to the CPU)
+        let in_arena5 = [true, true, true, false, false, true];
+        let m = plan_arena(6, &score, &loc, &key, &in_arena5, &[false], &[], 4);
+        assert_eq!(m, vec![
+            Move { new: (0, 3), store: TO_ARENA, victim: (0, 5), from: None },
+            Move { new: (0, 4), store: TO_ARENA, victim: (0, 0), from: None },
+        ]);
+        let m = plan_arena(6, &score, &loc, &key, &in_arena5, &[true], &[], 4);
+        assert_eq!(m, vec![Move { new: (0, 3), store: TO_ARENA, victim: (0, 0), from: None }]);
     }
 
     #[test]
