@@ -766,7 +766,7 @@ impl<'m> GpuModel<'m> {
                 m.drop_page_cache();
                 let t = std::time::Instant::now();
                 let (a, rest) = crate::experts::Arena::new(m, &cpu, (pl.arena_gb * 1e9) as usize)?;
-                eprintln!("arena: {} experts, {:.1} GB in {:.0} s; {} left in the file", a.slots.len(), a.bytes as f64 / 1e9, t.elapsed().as_secs_f64(), rest.len());
+                eprintln!("arena: {} experts, {:.1} GB in {:.0} s; {} left in the file", a.len(), a.bytes as f64 / 1e9, t.elapsed().as_secs_f64(), rest.len());
                 // If O_DIRECT was unavailable the arena filled through the mmap: evict those pages again now that the
                 // arena owns the bytes, before the server starts serving at near-full RAM.
                 m.drop_page_cache();
@@ -814,8 +814,8 @@ impl<'m> GpuModel<'m> {
                         [x.gate.bytes().len() as u32, x.up.bytes().len() as u32, x.down.bytes().len() as u32]
                     })
                     .collect();
-                // moves from the CPU need a fixed-set store; exchanges between GPUs need two stores that can swap
-                if tier_stores.iter().any(|s| s.tier_swaps) || tier_stores.iter().filter(|s| s.swaps).count() >= 2 {
+                // moves from the CPU need a fixed-set store, exchanges two stores that can swap, arena moves an arena
+                if tier_stores.iter().any(|s| s.tier_swaps) || tier_stores.iter().filter(|s| s.swaps).count() >= 2 || arena.is_some() {
                     // pinned slots for the experts on their way to a GPU (the background thread fills them); an exchange
                     // carries two experts
                     let max_raw = lens.iter().map(|l| l.iter().map(|&n| n as usize).sum::<usize>()).max().unwrap_or(0);
@@ -855,7 +855,7 @@ impl<'m> GpuModel<'m> {
                     model_disk: crate::tier::disk_key(&path), model_read_mb_s: read, slow_media: slow,
                 };
                 crate::tier::remove_stale_temps(&bg.state);
-                let mb: &'static ModelExperts = Box::leak(Box::new(ModelExperts(ms, arena)));
+                let mb: &'static ModelExperts = Box::leak(Box::new(ModelExperts(ms)));
                 gm.tier_thread = crate::tier::Tier::spawn(bg, mb);
             }
             // adaptive residency starts from the calibration prior: each expert's expected decayed score (its share of
@@ -1222,17 +1222,19 @@ impl<'m> GpuModel<'m> {
         Ok(())
     }
 
-    /// Between tokens: start at most one of tiering's planned moves, checked against the current state (a stale plan is
-    /// dropped). Same protocol as adapt_step: a victim leaves its store's table now and the CPU computes it from the next
-    /// token on; the new expert enters a table only at commit, after its copy completed.
+    /// Between tokens (and, with `idle`, in a pause): start at most one of tiering's planned moves, checked against the
+    /// current state (a stale plan is dropped). GPU moves use the protocol of adapt_step: a victim leaves its store's
+    /// table now and the CPU computes it from the next token on; the new expert enters a table only at commit, after its
+    /// copy completed.
     /// * A move from the CPU: the new expert (on no GPU) replaces a colder resident of a fixed-set store.
-    /// * An exchange: the new expert leaves a late aux GPU for the main GPU and the main GPU's colder victim takes its
-    ///   slot there. Both leave their tables before either copy starts, so no expert is ever resident on two GPUs; until
-    ///   their copies land, the CPU computes both.
-    fn tier_step(&mut self) -> Result<bool> {
+    /// * An exchange: the new expert leaves a late GPU for an early one, whose colder victim takes its slot there. Both
+    ///   leave their tables before either copy starts, so no expert is ever resident on two GPUs; until their copies
+    ///   land, the CPU computes both.
+    /// * A move into the arena (pauses only): a hot expert of the file side takes a cold one's place in the arena.
+    fn tier_step(&mut self, idle: bool) -> Result<bool> {
         let (Some(t), Some(w)) = (self.tier, self.worker.as_ref()) else { return Ok(false) };
         let Some(pf) = t.prefetch() else { return Ok(false) };
-        let Some((slot, mv)) = pf.take() else { return Ok(false) };
+        let Some((slot, mv)) = pf.take(idle) else { return Ok(false) };
         let m = self.m;
         let ne = m.cfg.n_experts;
         let ((l, e), (vl, ve)) = (mv.new, mv.victim);
@@ -1240,18 +1242,44 @@ impl<'m> GpuModel<'m> {
         let types = (x.gate.ty, x.down.ty);
         let fits = |raw: [&[u8]; 3], x: &crate::model::Expert| raw[0].len() == x.gate.bytes().len() && raw[1].len() == x.up.bytes().len() && raw[2].len() == x.down.bytes().len();
         let busy = self.exp0.iter().flat_map(|s| s.pending()).chain(self.aux.iter().flat_map(|a| a.exp.pending())).any(|p| p == (l, e) || p == (vl, ve));
+        let on_cpu = |l: usize, e: usize| w.on_cpu[l * ne + e].load(std::sync::atomic::Ordering::Relaxed);
         let side = |(l, e): (usize, usize)| if self.arena.is_some_and(|a| a.get(l, e).is_some()) { crate::tier::LOC_ARENA } else { crate::tier::LOC_FILE };
         let (loc_new, loc_victim) = (side((l, e)), side((vl, ve)));
+        if mv.store == crate::tier::TO_ARENA {
+            // both are the CPU's, on no GPU and in no copy; then nothing reads the arena in a pause once the streams are done
+            let ok = idle && !busy && on_cpu(l, e) && on_cpu(vl, ve) && !self.resident(l, e) && !self.resident(vl, ve)
+                && loc_new == crate::tier::LOC_FILE && loc_victim == crate::tier::LOC_ARENA;
+            let mut done = false;
+            if let (true, Some(arena), Some(raw)) = (ok, self.arena, pf.parts(slot)) {
+                if fits(raw, x) {
+                    self.g.sync()?;
+                    self.g.side_sync()?;
+                    for a in &self.aux {
+                        a.g.sync()?;
+                        a.g.side_sync()?;
+                    }
+                    done = arena.replace((vl, ve), (l, e), raw);
+                }
+            }
+            if done {
+                t.set_loc(l, e, crate::tier::LOC_ARENA);
+                t.set_loc(vl, ve, crate::tier::LOC_FILE);
+                self.tier_swaps += 1;
+            }
+            pf.release(slot);
+            self.g.bind();
+            return Ok(done);
+        }
+        // every store by its tiering index: the main GPU's, then the aux GPUs'
+        let new_on_gpu = self.resident(l, e);
+        let adapt0 = self.adapt;
+        let mut stores: Vec<Option<(&Gpu, &mut crate::experts::GpuExperts, bool)>> =
+            std::iter::once(self.exp0.as_mut().map(|s| (&self.g, s, adapt0 > 0))).chain(self.aux.iter_mut().map(|a| Some((&a.g, &mut a.exp, a.adaptive)))).collect();
         let mut started = false;
         match mv.from {
             None => {
-                let free = !busy && !self.resident(l, e) && w.on_cpu[l * ne + e].load(std::sync::atomic::Ordering::Relaxed);
-                let target: Option<(&Gpu, &mut crate::experts::GpuExperts)> = match mv.store {
-                    0 if self.adapt == 0 => self.exp0.as_mut().map(|s| (&self.g, s)),
-                    i => self.aux.get_mut(i.wrapping_sub(1)).filter(|a| !a.adaptive).map(|a| (&a.g, &mut a.exp)),
-                };
-                if let (true, Some((g, s)), Some(raw)) = (free, target, pf.parts(slot)) {
-                    if s.has(vl, ve) && s.swap_room() > 0 && s.types(vl, ve) == Some(types) && fits(raw, x) {
+                if let (true, Some(Some((g, s, adaptive))), Some(raw)) = (!busy && !new_on_gpu && on_cpu(l, e), stores.get_mut(mv.store), pf.parts(slot)) {
+                    if !*adaptive && s.has(vl, ve) && s.swap_room() > 0 && s.types(vl, ve) == Some(types) && fits(raw, x) {
                         started = s.begin_swap(g, (vl, ve), (l, e), raw)?;
                     }
                 }
@@ -1261,16 +1289,18 @@ impl<'m> GpuModel<'m> {
                     self.tier_moves.push(((l, e), slot));
                 }
             }
-            Some(src) => {
-                let (s0, a) = (self.exp0.as_mut(), self.aux.get_mut(src.wrapping_sub(1)));
-                if let (false, 0, Some(s0), Some(a), Some(raw), Some(vraw)) = (busy, mv.store, s0, a, pf.parts(slot), pf.victim_parts(slot)) {
-                    let ready = a.exp.has(l, e) && s0.has(vl, ve) && a.exp.swap_room() > 0 && s0.swap_room() > 0
-                        && a.exp.types(l, e) == Some(types) && s0.types(vl, ve) == Some(types) && fits(raw, x) && fits(vraw, v);
+            Some(src) if src != mv.store && src.max(mv.store) < stores.len() => {
+                let (lo, hi) = stores.split_at_mut(src.max(mv.store));
+                let (a, b) = (&mut lo[src.min(mv.store)], &mut hi[0]);
+                let (from, to) = if src < mv.store { (a, b) } else { (b, a) };
+                if let (false, Some((gf, sf, _)), Some((gt, st, _)), Some(raw), Some(vraw)) = (busy, from.as_mut(), to.as_mut(), pf.parts(slot), pf.victim_parts(slot)) {
+                    let ready = sf.has(l, e) && st.has(vl, ve) && sf.swap_room() > 0 && st.swap_room() > 0
+                        && sf.types(l, e) == Some(types) && st.types(vl, ve) == Some(types) && fits(raw, x) && fits(vraw, v);
                     if ready {
                         // both checks passed on this thread: the second begin_swap cannot be refused
-                        started = s0.begin_swap(&self.g, (vl, ve), (l, e), raw)?;
+                        started = st.begin_swap(gt, (vl, ve), (l, e), raw)?;
                         if started {
-                            anyhow::ensure!(a.exp.begin_swap(&a.g, (l, e), (vl, ve), vraw)?, "tier: exchange could not start its second half");
+                            anyhow::ensure!(sf.begin_swap(gf, (l, e), (vl, ve), vraw)?, "tier: exchange could not start its second half");
                         }
                     }
                 }
@@ -1283,6 +1313,7 @@ impl<'m> GpuModel<'m> {
                     self.tier_moves.push(((vl, ve), slot));
                 }
             }
+            Some(_) => {}
         }
         if started {
             self.tier_swaps += 1;
@@ -1294,15 +1325,15 @@ impl<'m> GpuModel<'m> {
     }
 
     /// While the server is idle (a pause of tier::IDLE_MS): one slice of tiering's moves on the engine thread. Commits
-    /// finished copies and starts the next prefetched move (at most one in flight per store); no token runs, so the
-    /// victim's CPU flag is set at once. Returns true while moves remain (the caller comes back at once).
+    /// finished copies and starts the next prefetched move (at most one in flight per store) or does one arena move; no
+    /// token runs, so a victim's CPU flag is set at once. Returns true while moves remain (the caller comes back at once).
     pub fn tier_idle(&mut self) -> Result<bool> {
         let Some(t) = self.tier else { return Ok(false) };
         if !self.tier_swap || !t.is_idle() {
             return Ok(false);
         }
         self.commit_swaps(false)?;
-        let started = self.tier_step()?;
+        let started = self.tier_step(true)?;
         if let Some(w) = self.worker.as_ref() {
             for (i, v) in self.adapt_flags.drain(..) {
                 w.on_cpu[i].store(v, std::sync::atomic::Ordering::Relaxed);
@@ -2057,7 +2088,7 @@ impl<'m> GpuModel<'m> {
                 }
             }
             if self.tier_swap {
-                self.tier_step()?;
+                self.tier_step(false)?;
             }
             self.tier_collect()?;
             if let Some(w) = self.worker.as_ref() {
@@ -2855,14 +2886,12 @@ impl GpuModel<'_> {
     }
 }
 
-/// The model's expert bytes for the tiering thread: the arena's copy when it holds one, else the mapped file.
-struct ModelExperts(&'static Model, Option<&'static crate::experts::Arena>);
+/// The model's expert bytes for the tiering thread: always the mapped file (the arena changes in pauses, on the engine
+/// thread; this thread never reads it).
+struct ModelExperts(&'static Model);
 
 impl crate::tier::ExpertBytes for ModelExperts {
     fn parts(&self, l: usize, e: usize) -> [&[u8]; 3] {
-        if let Some(p) = self.1.and_then(|a| a.get(l, e)) {
-            return p;
-        }
         let x = &self.0.layers[l].experts[e];
         [x.gate.bytes(), x.up.bytes(), x.down.bytes()]
     }

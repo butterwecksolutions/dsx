@@ -9,8 +9,10 @@
 //!   depend on the hardware: one score serves every GPU combination the model is started with.
 //! * **Who is waited for.** Every 64th decode token one layer (rotating) is timed on the main GPU: after its own work
 //!   it waits for the CPU's experts, then for each aux GPU (`Waits`). The device that finishes last gets work taken
-//!   away: a late aux GPU exchanges its hottest experts for colder ones of the main GPU (`plan_exchanges`); a late CPU
-//!   hands hot experts to fixed-set GPU stores that are not late (`plan_moves`).
+//!   away: a late aux GPU exchanges its hottest experts for colder ones of a GPU that is not late (`plan_exchanges`); a
+//!   late CPU hands hot experts to fixed-set GPU stores that are not late (`plan_moves`).
+//! * **Arena.** In pauses, hot experts of the file side take the place of cold ones in the RAM arena (`plan_arena`,
+//!   `Arena::replace` on the engine thread), so what is in use ends up on GPUs and in RAM.
 //! * **Run time.** The plans' experts are copied into pinned prefetch slots by this thread; the engine starts them
 //!   between tokens (at most one per token) and in pauses back to back (`GpuModel::tier_step`, `tier_idle`), with the
 //!   protocol of adaptive replacement: a victim leaves its table first and the CPU computes it meanwhile; a new expert
@@ -362,7 +364,8 @@ impl Drop for Thread {
 // ------------------------------------------------------------------------------------------------ run-time moves
 
 /// A planned move: `new` replaces `victim` in GPU store `store`. With `from`, it is an exchange between two GPUs: `new`
-/// leaves store `from` and `victim` takes its slot there, so both stores stay full and no expert is on two GPUs.
+/// leaves store `from` and `victim` takes its slot there, so both stores stay full and no expert is on two GPUs. With
+/// `store == TO_ARENA`, `new` (read from the file side) takes `victim`'s place in the RAM arena.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Move {
     pub new: (usize, usize),
@@ -370,6 +373,11 @@ pub struct Move {
     pub victim: (usize, usize),
     pub from: Option<usize>,
 }
+
+/// `Move::store` of a move into the RAM arena
+pub const TO_ARENA: usize = usize::MAX;
+/// arena moves prefetched at a time (they run only in pauses and must not hold up moves onto GPUs)
+const ARENA_SLOTS: usize = 2;
 
 const SLOT_FREE: u8 = 0;
 const SLOT_FILLING: u8 = 1;
@@ -420,14 +428,20 @@ impl Prefetch {
         self.state[i].store(SLOT_FREE, Ordering::Release);
     }
 
-    /// The engine takes the next ready move (the slot stays in use until `release`).
-    pub fn take(&self) -> Option<(usize, Move)> {
+    /// The engine takes the next ready move (the slot stays in use until `release`). Arena moves wait for a pause
+    /// (`idle`): they need the arena unused.
+    pub fn take(&self, idle: bool) -> Option<(usize, Move)> {
         for i in 0..self.state.len() {
+            if self.state[i].load(Ordering::Acquire) != SLOT_READY {
+                continue;
+            }
+            // only this thread takes slots: a ready one stays ready until taken here
+            let Some((mv, _, _)) = *self.mv[i].lock().unwrap() else { continue };
+            if mv.store == TO_ARENA && !idle {
+                continue;
+            }
             if self.state[i].compare_exchange(SLOT_READY, SLOT_BUSY, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                if let Some((mv, _, _)) = *self.mv[i].lock().unwrap() {
-                    return Some((i, mv));
-                }
-                self.release(i);
+                return Some((i, mv));
             }
         }
         None
@@ -518,39 +532,81 @@ pub fn plan_moves(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[S
     out
 }
 
-/// Plan up to `room` exchanges that take work off GPUs finishing last (`late`, store indices) onto the main GPU (store
-/// 0): the hottest expert of a late store swaps places with a resident of the main store of the same key and at most
-/// `MOVE_RATIO` of its score. Both stores stay full; the late one keeps a colder expert. Both stores must be able to
-/// replace experts at run time.
-pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[StoreInfo], late: &[usize], busy: &[Move], room: usize) -> Vec<Move> {
+/// Plan up to `room` exchanges that take work off GPUs finishing last (`late`, store indices) onto GPUs that do not
+/// (`early`: the main GPU, which waits for the others, and aux GPUs it does not wait for): the hottest expert of a late
+/// store swaps places with the coldest resident of the same key in an early store, if that one has at most `MOVE_RATIO`
+/// of its score. Both stores stay full; the late one keeps a colder expert. Both must be able to replace experts at
+/// run time.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[StoreInfo], late: &[usize], early: &[usize], busy: &[Move], room: usize) -> Vec<Move> {
     let ne = ne.max(1);
-    if room == 0 || !stores.first().is_some_and(|s| s.swaps) {
-        return vec![];
-    }
-    let late: Vec<usize> = late.iter().copied().filter(|&i| i > 0 && stores.get(i).is_some_and(|s| s.swaps)).collect();
-    if late.is_empty() {
+    let can = |i: usize| stores.get(i).is_some_and(|s| s.swaps);
+    let late: Vec<usize> = late.iter().copied().filter(|&i| can(i)).collect();
+    let early: Vec<usize> = early.iter().copied().filter(|&i| can(i) && !late.contains(&i)).collect();
+    if room == 0 || late.is_empty() || early.is_empty() {
         return vec![];
     }
     let mut off: std::collections::HashSet<usize> = busy.iter().flat_map(|m| [m.new, m.victim]).map(|(l, e)| l * ne + e).collect();
-    // main-store residents by key, coldest last
-    let mut cold: HashMap<u32, Vec<(f64, usize)>> = HashMap::new();
+    // early stores' residents by key, coldest last
+    let mut cold: HashMap<u32, Vec<(f64, usize, usize)>> = HashMap::new();
+    let mut hot: Vec<(f64, usize, usize)> = vec![];
     for i in 0..score.len() {
-        if loc[i] == LOC_GPU {
-            cold.entry(key[i]).or_default().push((score[i], i));
+        let Some(st) = loc[i].checked_sub(LOC_GPU).map(usize::from) else { continue };
+        if early.contains(&st) {
+            cold.entry(key[i]).or_default().push((score[i], i, st));
+        } else if late.contains(&st) && score[i] >= MOVE_MIN_SCORE {
+            hot.push((score[i], i, st));
         }
     }
     for v in cold.values_mut() {
         v.sort_by(|a, b| b.0.total_cmp(&a.0));
     }
-    let mut hot: Vec<(f64, usize, usize)> = (0..score.len())
-        .filter_map(|i| {
-            let s = loc[i].checked_sub(LOC_GPU)? as usize;
-            (late.contains(&s) && score[i] >= MOVE_MIN_SCORE).then_some((score[i], i, s))
-        })
-        .collect();
     hot.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut out = vec![];
     for (sc, i, src) in hot {
+        if out.len() >= room {
+            break;
+        }
+        if off.contains(&i) {
+            continue;
+        }
+        let Some(list) = cold.get_mut(&key[i]) else { continue };
+        while list.last().is_some_and(|x| off.contains(&x.1)) {
+            list.pop();
+        }
+        let Some(&(vs, vi, dst)) = list.last() else { continue };
+        if vs > sc * MOVE_RATIO {
+            continue;
+        }
+        list.pop();
+        off.insert(i);
+        off.insert(vi);
+        out.push(Move { new: (i / ne, i % ne), store: dst, victim: (vi / ne, vi % ne), from: Some(src) });
+    }
+    out
+}
+
+/// Plan up to `room` moves into the RAM arena: the hottest experts the CPU reads from the file side against the
+/// coldest ones it reads from the arena, same key (so the same byte lengths), a victim at most `MOVE_RATIO` of the
+/// candidate's score.
+pub fn plan_arena(ne: usize, score: &[f64], loc: &[u8], key: &[u32], busy: &[Move], room: usize) -> Vec<Move> {
+    let ne = ne.max(1);
+    let mut off: std::collections::HashSet<usize> = busy.iter().flat_map(|m| [m.new, m.victim]).map(|(l, e)| l * ne + e).collect();
+    let mut cold: HashMap<u32, Vec<(f64, usize)>> = HashMap::new();
+    let mut hot: Vec<(f64, usize)> = vec![];
+    for i in 0..score.len() {
+        match loc[i] {
+            LOC_ARENA => cold.entry(key[i]).or_default().push((score[i], i)),
+            LOC_FILE if score[i] >= MOVE_MIN_SCORE => hot.push((score[i], i)),
+            _ => {}
+        }
+    }
+    for v in cold.values_mut() {
+        v.sort_by(|a, b| b.0.total_cmp(&a.0));
+    }
+    hot.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut out = vec![];
+    for (sc, i) in hot {
         if out.len() >= room {
             break;
         }
@@ -568,7 +624,7 @@ pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores:
         list.pop();
         off.insert(i);
         off.insert(vi);
-        out.push(Move { new: (i / ne, i % ne), store: 0, victim: (vi / ne, vi % ne), from: Some(src) });
+        out.push(Move { new: (i / ne, i % ne), store: TO_ARENA, victim: (vi / ne, vi % ne), from: None });
     }
     out
 }
@@ -621,6 +677,12 @@ impl Waits {
             return vec![];
         }
         (1..stores).filter(|&i| self.aux_us.get(i - 1).is_some_and(|&a| a > WAIT_US)).collect()
+    }
+
+    /// GPUs that can take work from late ones: the main GPU (it is the one waiting) and aux GPUs it does not wait for.
+    pub fn early(&self, stores: usize) -> Vec<usize> {
+        let late = self.late(stores);
+        (0..stores).filter(|i| !late.contains(i)).collect()
     }
 }
 
@@ -1308,9 +1370,6 @@ impl Background {
     /// Plan and prefetch run-time moves into free slots. Returns the number planned.
     pub fn prefetch_moves(&self, m: &dyn ExpertBytes) -> usize {
         let (Some(pf), Some(stores), Some(key)) = (self.tier.prefetch.get(), self.tier.stores.get(), self.tier.key.get()) else { return 0 };
-        if !stores.iter().any(|s| s.tier_swaps || s.swaps) {
-            return 0;
-        }
         let free = pf.state.iter().filter(|s| s.load(Ordering::Relaxed) == SLOT_FREE).count();
         if free == 0 {
             return 0;
@@ -1321,10 +1380,17 @@ impl Background {
         let w = self.tier.waits();
         let score = &self.saved.learned.score;
         // work off GPUs that finish last first, then off the CPU onto GPUs with room
-        let mut moves = plan_exchanges(ne, score, &loc, key, stores, &w.late(stores.len()), &busy, free);
+        let mut moves = plan_exchanges(ne, score, &loc, key, stores, &w.late(stores.len()), &w.early(stores.len()), &busy, free);
         busy.extend(moves.iter().copied());
         if stores.iter().any(|s| s.tier_swaps) {
             let more = plan_moves(ne, score, &loc, key, stores, &w.open(stores.len()), &busy, free - moves.len());
+            busy.extend(more.iter().copied());
+            moves.extend(more);
+        }
+        // the arena follows use in pauses: hot experts of the file side take the place of cold ones in it
+        let arena_busy = busy.iter().filter(|m| m.store == TO_ARENA).count();
+        if self.tier.is_idle() && arena_busy < ARENA_SLOTS {
+            let more = plan_arena(ne, score, &loc, key, &busy, (free - moves.len()).min(ARENA_SLOTS - arena_busy));
             moves.extend(more);
         }
         let mut n = 0;
@@ -1688,6 +1754,7 @@ mod tests {
             t3.add(50.0, &[0.0, 70.0]);
         }
         assert_eq!(t3.late(3), vec![2]);
+        assert_eq!(t3.early(3), vec![0, 1]);
         assert_eq!(t3.open(3), vec![true, true, false]);
         let t = Tier::new(1, 1);
         t.note_waits(0.3, &[0.09]);
@@ -1703,12 +1770,31 @@ mod tests {
         let loc = [LOC_GPU, LOC_GPU, LOC_GPU + 1, LOC_GPU + 1, LOC_GPU + 1, LOC_ARENA, LOC_FILE, LOC_FILE];
         let key = [1, 1, 1, 1, 2, 1, 1, 1];
         let score = [2.0, 40.0, 50.0, 90.0, 500.0, 70.0, 0.0, 0.0];
-        let m = plan_exchanges(8, &score, &loc, &key, &stores, &[1], &[], 4);
+        let m = plan_exchanges(8, &score, &loc, &key, &stores, &[1], &[0], &[], 4);
         // 90 swaps with the coldest main resident (2); 50 would need one at most 25: 40 is too warm
         assert_eq!(m, vec![Move { new: (0, 3), store: 0, victim: (0, 0), from: Some(1) }]);
-        assert!(plan_exchanges(8, &score, &loc, &key, &stores, &[], &[], 4).is_empty(), "nothing late");
-        assert!(plan_exchanges(8, &score, &loc, &key, &[st(false), st(true)], &[1], &[], 4).is_empty(), "main cannot swap");
-        assert!(plan_exchanges(8, &score, &loc, &key, &stores, &[1], &m, 4).is_empty(), "in transit");
+        assert!(plan_exchanges(8, &score, &loc, &key, &stores, &[], &[0, 1], &[], 4).is_empty(), "nothing late");
+        assert!(plan_exchanges(8, &score, &loc, &key, &[st(false), st(true)], &[1], &[0], &[], 4).is_empty(), "main cannot swap");
+        assert!(plan_exchanges(8, &score, &loc, &key, &stores, &[1], &[0], &m, 4).is_empty(), "in transit");
+        // three GPUs of different kinds: the late one (2) hands its hottest to whichever early GPU holds the coldest
+        let stores3 = vec![st(true), st(true), st(true)];
+        let loc3 = [LOC_GPU, LOC_GPU + 1, LOC_GPU + 2, LOC_GPU + 2, LOC_ARENA, LOC_FILE, LOC_FILE, LOC_FILE];
+        let score3 = [30.0, 3.0, 80.0, 9.0, 0.0, 0.0, 0.0, 0.0];
+        let m3 = plan_exchanges(8, &score3, &loc3, &[1; 8], &stores3, &[2], &[0, 1], &[], 4);
+        assert_eq!(m3, vec![Move { new: (0, 2), store: 1, victim: (0, 1), from: Some(2) }]);
+    }
+
+    #[test]
+    fn arena_takes_hot_file_side_experts_for_cold_ones() {
+        // 1 layer x 6: arena holds 0 (cold), 1 (warm), 2 (other key); file side 3 (hot), 4 (lukewarm); 5 on a GPU
+        let loc = [LOC_ARENA, LOC_ARENA, LOC_ARENA, LOC_FILE, LOC_FILE, LOC_GPU];
+        let key = [1, 1, 2, 1, 1, 1];
+        let score = [4.0, 30.0, 0.0, 50.0, 20.0, 99.0];
+        let m = plan_arena(6, &score, &loc, &key, &[], 4);
+        // 50 takes the place of 4; 20 would need a victim of at most 10: 30 is too warm
+        assert_eq!(m, vec![Move { new: (0, 3), store: TO_ARENA, victim: (0, 0), from: None }]);
+        assert!(plan_arena(6, &score, &loc, &key, &m, 4).is_empty(), "in transit");
+        assert!(plan_arena(6, &score, &[LOC_FILE; 6], &key, &[], 4).is_empty(), "no arena");
     }
 
     #[test]
@@ -1720,11 +1806,11 @@ mod tests {
         assert!(pf.fill(i, mv, [&[1u8; 10], &[2u8; 20], &[3u8; 30]], None));
         assert!(pf.victim_parts(i).is_none());
         assert_eq!(pf.in_transit(), vec![mv]);
-        let (j, got) = pf.take().unwrap();
+        let (j, got) = pf.take(false).unwrap();
         assert_eq!((j, got), (i, mv));
         let p = pf.parts(j).unwrap();
         assert_eq!((p[0].len(), p[1][0], p[2][29]), (10, 2, 3));
-        assert!(pf.take().is_none(), "busy until released");
+        assert!(pf.take(false).is_none(), "busy until released");
         pf.release(j);
         assert!(pf.in_transit().is_empty());
         let k = pf.claim().unwrap();
@@ -1733,10 +1819,17 @@ mod tests {
         let x = Move { new: (0, 3), store: 0, victim: (0, 4), from: Some(1) };
         let k = pf.claim().unwrap();
         assert!(pf.fill(k, x, [&[7u8; 5], &[7u8; 5], &[7u8; 5]], Some([&[9u8; 4], &[9u8; 4], &[9u8; 4]])));
-        let (j, _) = pf.take().unwrap();
+        let (j, _) = pf.take(false).unwrap();
         let v = pf.victim_parts(j).unwrap();
         assert_eq!((v[0].len(), v[2][3]), (4, 9));
         assert_eq!(pf.parts(j).unwrap()[0][0], 7);
+        pf.release(j);
+        // a move into the arena is only handed out in a pause
+        let a = Move { new: (0, 5), store: TO_ARENA, victim: (0, 6), from: None };
+        let k = pf.claim().unwrap();
+        assert!(pf.fill(k, a, [&[1u8; 5], &[1u8; 5], &[1u8; 5]], None));
+        assert!(pf.take(false).is_none());
+        assert_eq!(pf.take(true), Some((k, a)));
         drop(mem);
     }
 

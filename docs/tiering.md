@@ -16,7 +16,7 @@ no option and adapts to whatever GPUs, RAM and disks a start finds.
 | every 64th decode token | one layer (rotating through all of them) is timed with CUDA events: each GPU's expert kernels, and how long the main GPU waits for the CPU and then for each aux GPU |
 | every 10 s | a background thread folds the counts into a long-term score per expert (half-life 200k decode tokens) |
 | between tokens, at most one per token | a planned move or exchange starts (see below) |
-| in every pause of 2 s | the engine thread runs planned moves and exchanges back to back; the background thread warms the page cache with the hottest experts the CPU reads from the file side and, on a slow medium, copies them into an SSD buffer. All of it stops when a request arrives |
+| in every pause of 2 s | the engine thread runs planned moves and exchanges back to back and lets hot experts of the file side take the place of cold ones in the RAM arena; the background thread warms the page cache with the hottest experts the CPU still reads from the file side and, on a slow medium, copies them into an SSD buffer. All of it stops when a request arrives |
 | every 2 min, busy or not | the state is saved atomically next to the model; the previous version stays as `.prev` |
 | next startup | the learned score is blended into the ranking before placement |
 
@@ -32,7 +32,7 @@ on) this says which device is on the critical path, and tiering moves work away 
 
 | The main GPU waits | Meaning | What tiering does |
 |---|---|---|
-| for an aux GPU (> 20 µs after the CPU) | that aux GPU finishes last | **exchanges**: its hottest experts swap places with colder ones on the main GPU |
+| for an aux GPU (> 20 µs after the CPU) | that aux GPU finishes last | **exchanges**: its hottest experts swap places with colder ones on a GPU that is not late: the main GPU, or an aux GPU the main GPU does not wait for |
 | for the CPU (> 20 µs), not for aux GPUs | the CPU finishes last | **moves**: hot experts the CPU computes go onto GPUs with a fixed set that are not late |
 | for nobody | the main GPU is last or all are even | nothing |
 
@@ -49,13 +49,17 @@ adaptive replacement (`GpuExperts::begin_swap` / `commit_ready`):
   links): the victim leaves the store's table first and the CPU computes it from the next token on; the new expert's
   bytes go to the victim's slot on the side stream after the current token's kernels and enter the table only when the
   copy has completed.
-- **Exchange between GPUs** (a late aux GPU and the main GPU, both able to replace experts): the hot expert leaves the
-  aux GPU's table and the main GPU's colder victim leaves the main GPU's table, both before either copy starts. Until
-  the copies land, the CPU computes both. Then the hot expert is resident on the main GPU and the victim in the hot
-  expert's old slot on the aux GPU. Both stores stay full; no expert is ever resident on two GPUs.
+- **Exchange between GPUs** (a late GPU and one that is not, both able to replace experts; any number and mix of
+  GPUs): the hot expert leaves the late GPU's table and the other GPU's colder victim leaves its table, both before
+  either copy starts. Until the copies land, the CPU computes both. Then the hot expert is resident on the GPU with
+  room and the victim in the hot expert's old slot. Both stores stay full; no expert is ever resident on two GPUs.
+- **Move into the arena** (pauses only): a hot expert the CPU reads from the file side takes the place of a colder
+  one in the arena (same quant types, so the same size). It happens on the engine thread while no pass runs, the CPU
+  worker is idle and every stream is synchronized, so nothing reads the arena meanwhile; the background thread never
+  reads the arena. With enough pauses the experts in use end up on GPUs and in RAM, and the disk is no longer read.
 
 A candidate needs a learned score of at least 8 and a victim of at most half its score. Stores that already swap by
-recent use (`DSX_ADAPT`) keep doing so; they take part in exchanges only as the main GPU.
+recent use (`DSX_ADAPT`) keep doing so and take part in exchanges like any other.
 
 ## State
 
@@ -121,10 +125,10 @@ tier: {"picks":{…},"share_from_file":…,"experts_on_gpus":…,"moves_planned"
 
 ## Not done here
 
-- The arena is not reshuffled while the server runs (it is a pinned, CUDA-registered allocation); the page cache and
-  the SSD buffer serve the file side instead, and learned use reaches the arena at the next start.
+- The arena's size is fixed at startup (`--arena-gb`); its contents follow use in pauses.
 - GPU memory budgets are taken at startup; a GPU added or freed while the server runs is used at the next start.
-- Exchanges go between aux GPUs and the main GPU, not between two aux GPUs; the main GPU is still chosen by host link.
+- Work only leaves GPUs the main GPU waits for; when the main GPU itself finishes last, nothing measures how much
+  room the others have, and nothing moves. The main GPU is still chosen by host link.
 - A full SSD buffer keeps what it holds; it does not follow later changes of use.
 - No measurement on a GPU machine is part of this change yet; it needs an A-B-A-B comparison with otherwise
   identical settings.
