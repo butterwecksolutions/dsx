@@ -80,6 +80,15 @@ pub const WORK_MOVE_EVERY: u64 = 16;
 const WAIT_US: f64 = 20.0;
 /// an exchanged expert is not exchanged again for this long, so two GPUs near the threshold do not pass it back and forth
 const REST_SECS: u32 = 900;
+/// with expert deferral (`DSX_DEFER`) a late aux GPU may also exchange with an adaptive store, but only this far behind:
+/// the experts that store hands back to the CPU are then mostly picked at deferred ranks (11.11.2026, without deferral:
+/// such exchanges took the CMP 170HX off the critical path, raised the CPU's picks and never the decode rate)
+const CLEAR_WAIT_US: f64 = 2.0 * WAIT_US;
+/// expert deferral in effect (`DSX_DEFER=R`, also set by `--defer-rank`); read like `handoff::defer`, which needs CUDA
+fn deferral_on() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("DSX_DEFER").ok().and_then(|v| v.parse::<usize>().ok()).is_some())
+}
 /// smoothing of the measured waits (weight of a new sample)
 const WAIT_EMA: f64 = 0.05;
 /// samples before the waits steer moves
@@ -367,6 +376,14 @@ impl Tier {
     /// An adaptive store started a replacement of its own.
     pub fn note_adaptive_swap(&self) {
         self.adaptive_swaps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// True while expert (l, e) rests after an exchange between GPUs: an adaptive store keeps it (it came there to take
+    /// work off a late GPU; handing it back to the CPU by recent use would undo that).
+    #[inline]
+    pub fn rests(&self, l: usize, e: usize) -> bool {
+        let now = self.t0.elapsed().as_secs() as u32;
+        self.moved.get(l * self.ne + e).is_some_and(|x| matches!(x.load(Ordering::Relaxed), t if t > 0 && now.saturating_sub(t) < REST_SECS))
     }
 
     /// Experts exchanged between GPUs less than `REST_SECS` ago.
@@ -681,13 +698,25 @@ pub fn plan_moves(ne: usize, score: &[f64], loc: &[u8], key: &[u32], copies: Opt
 /// but raised the CPU's picks per token (5.8 -> 8.2, 6.9 -> 9.2) and never the decode rate.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[StoreInfo], late: &[usize], early: &[usize], busy: &[Move], room: usize) -> Vec<Move> {
+    plan_exchanges_into(ne, score, loc, key, stores, late, early, busy, room, None).0
+}
+
+/// `plan_exchanges`, and with `adaptive = Some((in_arena, clear))` (expert deferral on) also into adaptive stores for late
+/// stores in `clear`. An expert that would enter an adaptive store without an arena copy is not exchanged yet: it comes
+/// back in the second list with the hot expert's score, to get its copy first (`plan_arena`).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_exchanges_into(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores: &[StoreInfo], late: &[usize], early: &[usize], busy: &[Move], room: usize, adaptive: Option<(&[bool], &[usize])>) -> (Vec<Move>, Vec<(usize, f64)>) {
     let ne = ne.max(1);
-    let can = |i: usize| stores.get(i).is_some_and(|s| s.tier_swaps);
-    let late: Vec<usize> = late.iter().copied().filter(|&i| can(i)).collect();
+    let fixed = |i: usize| stores.get(i).is_some_and(|s| s.tier_swaps);
+    let open = |i: usize| adaptive.is_some() && stores.get(i).is_some_and(|s| s.adaptive());
+    let can = |i: usize| fixed(i) || open(i);
+    let late: Vec<usize> = late.iter().copied().filter(|&i| fixed(i)).collect();
     let early: Vec<usize> = early.iter().copied().filter(|&i| can(i) && !late.contains(&i)).collect();
     if room == 0 || late.is_empty() || early.is_empty() {
-        return vec![];
+        return (vec![], vec![]);
     }
+    let (in_arena, clear): (&[bool], &[usize]) = adaptive.unwrap_or((&[], &[]));
+    let mut stage = vec![];
     let mut off: std::collections::HashSet<usize> = busy.iter().flat_map(|m| [m.new, m.victim]).map(|(l, e)| l * ne + e).collect();
     // early stores' residents by key, coldest last
     let mut cold: HashMap<u32, Vec<(f64, usize, usize)>> = HashMap::new();
@@ -706,7 +735,7 @@ pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores:
     hot.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut out = vec![];
     for (sc, i, src) in hot {
-        if out.len() >= room {
+        if out.len() + stage.len() >= room {
             break;
         }
         if off.contains(&i) {
@@ -717,15 +746,19 @@ pub fn plan_exchanges(ne: usize, score: &[f64], loc: &[u8], key: &[u32], stores:
             list.pop();
         }
         let Some(&(vs, vi, dst)) = list.last() else { continue };
-        if vs > sc * MOVE_RATIO {
+        if vs > sc * MOVE_RATIO || (open(dst) && !clear.contains(&src)) {
             continue;
         }
         list.pop();
         off.insert(i);
         off.insert(vi);
+        if open(dst) && !in_arena.get(i).copied().unwrap_or(false) {
+            stage.push((i, sc));
+            continue;
+        }
         out.push(Move { new: (i / ne, i % ne), store: dst, victim: (vi / ne, vi % ne), from: Some(src) });
     }
-    out
+    (out, stage)
 }
 
 /// Plan up to `room` moves into the RAM arena. Candidates: first `stage` (GPU residents that need an arena copy before
@@ -1569,8 +1602,9 @@ impl Background {
         let mut held = busy.clone();
         held.extend(self.tier.resting().into_iter().map(|i| Move { new: (i / ne, i % ne), store: 0, victim: (i / ne, i % ne), from: None }));
         let n = stores.len();
-        let mut moves = plan_exchanges(ne, score, &loc, key, stores, &w.late(n, WAIT_US), &w.early(n), &held, free);
-        let mut stage = vec![];
+        let clear = w.late(n, CLEAR_WAIT_US);
+        let deferral = deferral_on();
+        let (mut moves, mut stage) = plan_exchanges_into(ne, score, &loc, key, stores, &w.late(n, WAIT_US), &w.early(n), &held, free, deferral.then_some((&in_arena[..], &clear[..])));
         busy.extend(moves.iter().copied());
         if stores.iter().any(|s| s.tier_swaps) {
             let (more, more_stage) = plan_moves(ne, score, &loc, key, self.tier.has_arena().then_some(&in_arena[..]), stores, &w.open(n), &busy, free - moves.len());
@@ -2046,6 +2080,41 @@ mod tests {
         let score3 = [30.0, 3.0, 80.0, 9.0, 0.0, 0.0, 0.0, 0.0];
         let m3 = plan_exchanges(8, &score3, &loc3, &[1; 8], &stores3, &[2], &[0, 1], &[], 4);
         assert_eq!(m3, vec![Move { new: (0, 2), store: 1, victim: (0, 1), from: Some(2) }]);
+    }
+
+    #[test]
+    fn with_deferral_a_clearly_late_gpu_exchanges_into_the_adaptive_main_store() {
+        let adaptive = StoreInfo { uuid: "a".into(), name: "rtx".into(), link_gbs: 12.0, tier_swaps: false, swaps: true };
+        let fixed = StoreInfo { uuid: "f".into(), name: "cmp".into(), link_gbs: 6.0, tier_swaps: true, swaps: true };
+        let stores = [adaptive, fixed];
+        let loc = [LOC_GPU, LOC_GPU, LOC_GPU + 1, LOC_GPU + 1, LOC_ARENA, LOC_FILE, LOC_FILE, LOC_FILE];
+        let key = [1; 8];
+        let score = [2.0, 40.0, 50.0, 90.0, 0.0, 0.0, 0.0, 0.0];
+        let with_copy = [true, true, true, true, true, false, false, false];
+        // without deferral (None): adaptive main takes no part, as before
+        assert_eq!(plan_exchanges_into(8, &score, &loc, &key, &stores, &[1], &[0], &[], 4, None), (vec![], vec![]));
+        // deferral on and late by a clear margin: hottest aux expert 3 swaps with the coldest main resident 0
+        let (m, st) = plan_exchanges_into(8, &score, &loc, &key, &stores, &[1], &[0], &[], 4, Some((&with_copy, &[1])));
+        assert_eq!(m, vec![Move { new: (0, 3), store: 0, victim: (0, 0), from: Some(1) }]);
+        assert!(st.is_empty());
+        // late, but not clearly: nothing
+        assert_eq!(plan_exchanges_into(8, &score, &loc, &key, &stores, &[1], &[0], &[], 4, Some((&with_copy, &[]))).0, vec![]);
+        // the hot expert has no arena copy yet: staged for one, not exchanged
+        let no_copy = [true, true, true, false, true, false, false, false];
+        let (m, st) = plan_exchanges_into(8, &score, &loc, &key, &stores, &[1], &[0], &[], 4, Some((&no_copy, &[1])));
+        assert!(m.is_empty());
+        assert_eq!(st, vec![(3, 90.0)]);
+        // an adaptive store is never the late side
+        assert_eq!(plan_exchanges_into(8, &score, &loc, &key, &stores, &[0], &[1], &[], 4, Some((&with_copy, &[0]))).0, vec![]);
+    }
+
+    #[test]
+    fn exchanged_experts_rest() {
+        let t = Tier::new(1, 4);
+        assert!(!t.rests(0, 2));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        t.note_done(&Move { new: (0, 2), store: 0, victim: (0, 1), from: Some(1) });
+        assert!(t.rests(0, 2) && t.rests(0, 1) && !t.rests(0, 3));
     }
 
     #[test]

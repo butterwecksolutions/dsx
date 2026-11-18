@@ -1139,6 +1139,10 @@ impl<'m> GpuModel<'m> {
             .map(|(_, s)| {
                 let mut v: Victims = Default::default();
                 for (vl, ve) in s.residents() {
+                    // an expert tiering exchanged in to take work off a late GPU stays while it rests
+                    if tier.is_some_and(|t| t.rests(vl, ve)) {
+                        continue;
+                    }
                     v.entry(s.types(vl, ve).unwrap()).or_default().push((sc(vl, ve), vl, ve));
                 }
                 for x in v.values_mut() {
