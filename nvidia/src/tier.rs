@@ -66,6 +66,10 @@ const REWARM_SECS: u64 = 600;
 /// a planned move needs this much learned use, and a victim at most `MOVE_RATIO` of it
 const MOVE_MIN_SCORE: f64 = 8.0;
 const MOVE_RATIO: f64 = 0.5;
+/// weight of a pick at a deferred rank (`DSX_DEFER`) in the learned usage: the main GPU does not wait for it, so a GPU slot
+/// is worth more to an expert the router picks at an immediate rank (station, 3090 + CMP 170HX, --defer-rank 3: tiering
+/// on vs off +1.0 % with unweighted usage, against +10.9 % without deferral)
+pub const DEFERRED_WEIGHT: f64 = 0.25;
 pub const PREFETCH_SLOTS: usize = 4;
 pub const MAX_STORES: usize = 9;
 /// one sample (expert kernels and the main GPU's waits, one layer, rotating) per this many decode tokens
@@ -124,6 +128,8 @@ pub struct Tier {
     pub ne: usize,
     /// monotonic decode-pick counts per [layer * E + expert] (the CPU worker is the only writer)
     picks: Vec<AtomicU32>,
+    /// picks at a deferred rank (`DSX_DEFER`): computed one layer late, so the main GPU does not wait for them
+    deferred: Vec<AtomicU32>,
     hits: [AtomicU64; 4],
     /// per store: decode picks it computed
     store_picks: [AtomicU64; MAX_STORES],
@@ -223,6 +229,7 @@ impl Tier {
             nl,
             ne,
             picks: (0..nl * ne).map(|_| AtomicU32::new(0)).collect(),
+            deferred: (0..nl * ne).map(|_| AtomicU32::new(0)).collect(),
             hits: Default::default(),
             store_picks: Default::default(),
             gpu_ms: Mutex::new(vec![(0.0, 0); MAX_STORES]),
@@ -260,13 +267,19 @@ impl Tier {
         enabled() && self.nl == nl && self.ne == ne && !self.claimed.swap(true, Ordering::AcqRel)
     }
 
-    /// A decode pass's picks for one layer (all experts, GPU-resident ones included).
+    /// A decode pass's picks for one layer (all experts, GPU-resident ones included), in router rank order per token
+    /// (`top_k` per token). With `defer = Some(r)` the picks at rank r or lower are also counted as deferred: a CPU
+    /// computes them one layer late and the main GPU does not wait, so they weigh less in placement (`DEFERRED_WEIGHT`).
     #[inline]
-    pub fn note_picks(&self, l: usize, sel: &[i32]) {
+    pub fn note_picks(&self, l: usize, sel: &[i32], top_k: usize, defer: Option<usize>) {
         let base = l * self.ne;
-        for &e in sel {
+        for (i, &e) in sel.iter().enumerate() {
             if let Some(c) = self.picks.get(base + e as usize) {
                 c.store(c.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+                if defer.is_some_and(|r| i % top_k.max(1) >= r) {
+                    let d = &self.deferred[base + e as usize];
+                    d.store(d.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+                }
             }
         }
     }
@@ -431,6 +444,10 @@ impl Tier {
 
     fn snapshot_picks(&self) -> Vec<u32> {
         self.picks.iter().map(|c| c.load(Ordering::Relaxed)).collect()
+    }
+
+    fn snapshot_deferred(&self) -> Vec<u32> {
+        self.deferred.iter().map(|c| c.load(Ordering::Relaxed)).collect()
     }
 
     fn hits(&self) -> [u64; 4] {
@@ -839,16 +856,18 @@ impl Learned {
         Learned { score: vec![0.0; n], tokens: 0.0 }
     }
 
-    /// Add new picks (delta of the monotonic counters) after decaying by the tokens they represent.
-    pub fn fold(&mut self, delta: &[u32], top_k: usize, nl: usize) {
+    /// Add new picks (delta of the monotonic counters) after decaying by the tokens they represent. `deferred` (same
+    /// length or empty) holds how many of those picks were at a deferred rank; they count `DEFERRED_WEIGHT` each.
+    pub fn fold(&mut self, delta: &[u32], deferred: &[u32], top_k: usize, nl: usize) {
         let total: u64 = delta.iter().map(|&d| d as u64).sum();
         if total == 0 {
             return;
         }
         let tokens = total as f64 / (top_k.max(1) * nl.max(1)) as f64;
         let f = 0.5f64.powf(tokens / HALF_LIFE_TOKENS);
-        for (s, &d) in self.score.iter_mut().zip(delta) {
-            *s = *s * f + d as f64;
+        for (i, (s, &d)) in self.score.iter_mut().zip(delta).enumerate() {
+            let late = deferred.get(i).copied().unwrap_or(0).min(d) as f64;
+            *s = *s * f + (d as f64 - late) + late * DEFERRED_WEIGHT;
         }
         self.tokens += tokens;
     }
@@ -1663,6 +1682,7 @@ impl Background {
     /// last save, when the tier is stopped (the model is dropped).
     pub fn run(mut self, m: &'static dyn ExpertBytes) {
         let mut last = self.tier.snapshot_picks();
+        let mut last_d = self.tier.snapshot_deferred();
         let mut st = Stats::default();
         let mut warmed = std::collections::HashSet::new();
         let (mut last_save, mut last_fold, mut last_report) = (std::time::Instant::now(), std::time::Instant::now(), std::time::Instant::now());
@@ -1675,8 +1695,11 @@ impl Background {
                 let now = self.tier.snapshot_picks();
                 let delta: Vec<u32> = now.iter().zip(&last).map(|(a, b)| a.wrapping_sub(*b)).collect();
                 last = now;
+                let now_d = self.tier.snapshot_deferred();
+                let delta_d: Vec<u32> = now_d.iter().zip(&last_d).map(|(a, b)| a.wrapping_sub(*b)).collect();
+                last_d = now_d;
                 if delta.iter().any(|&d| d > 0) {
-                    self.saved.learned.fold(&delta, self.top_k, self.tier.nl);
+                    self.saved.learned.fold(&delta, &delta_d, self.top_k, self.tier.nl);
                     dirty = true;
                 }
             }
@@ -1734,14 +1757,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deferred_picks_weigh_less() {
+        // rank order per token, top_k 3, --defer-rank 1: ranks 1 and 2 are deferred
+        let t = Tier::new(2, 8);
+        t.note_picks(0, &[5, 6, 7, 5, 6, 7], 3, Some(1));
+        assert_eq!((t.snapshot_picks()[5], t.snapshot_deferred()[5]), (2, 0));
+        assert_eq!((t.snapshot_picks()[6], t.snapshot_deferred()[6]), (2, 2));
+        let mut l = Learned::new(16);
+        l.fold(&t.snapshot_picks(), &t.snapshot_deferred(), 3, 2);
+        assert_eq!(l.score[5], 2.0);
+        assert!((l.score[6] / l.score[5] - DEFERRED_WEIGHT).abs() < 1e-9);
+        // without deferral nothing changes, and a stale deferred count never exceeds the picks
+        let mut m = Learned::new(2);
+        m.fold(&[4, 4], &[0, 9], 2, 1);
+        assert_eq!(m.score[0] * DEFERRED_WEIGHT, m.score[1]);
+    }
+
+    #[test]
     fn fold_decays_and_counts_tokens() {
         let mut l = Learned::new(4);
-        l.fold(&[6, 0, 0, 0], 6, 1);
+        l.fold(&[6, 0, 0, 0], &[], 6, 1);
         assert_eq!(l.tokens, 1.0);
         assert!((l.score[0] - 6.0).abs() < 1e-9);
         l.score[1] = 10.0;
         let big = (HALF_LIFE_TOKENS * 6.0) as u32;
-        l.fold(&[0, 0, big, 0], 6, 1);
+        l.fold(&[0, 0, big, 0], &[], 6, 1);
         assert!((l.score[1] - 5.0).abs() < 1e-6, "{}", l.score[1]);
         assert!(l.alpha() <= ALPHA_MAX + 1e-12);
     }
@@ -1903,11 +1943,11 @@ mod tests {
     #[test]
     fn picks_hits_and_store_counts() {
         let t = Tier::new(2, 8);
-        t.note_picks(1, &[7, 3, 3]);
+        t.note_picks(1, &[7, 3, 3], 3, None);
         let s = t.snapshot_picks();
         assert_eq!(s[8 + 7], 1);
         assert_eq!(s[8 + 3], 2);
-        t.note_picks(1, &[99]); // out of range: ignored
+        t.note_picks(1, &[99], 3, None); // out of range: ignored
         t.note_hit(Hit::File, 2);
         assert_eq!(t.hits()[3], 2);
         t.set_loc(1, 3, LOC_GPU + 1);

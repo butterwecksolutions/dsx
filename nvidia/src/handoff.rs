@@ -288,7 +288,7 @@ impl CpuWorker {
                     x.copy_from_slice(xch.x(nt));
                     let (sel, wts) = (xch.sel(nt * top_k).to_vec(), xch.wts(nt * top_k).to_vec());
                     if let Some(t) = tier {
-                        t.note_picks(l, &sel);
+                        t.note_picks(l, &sel, top_k, if nt == 1 { defer() } else { None });
                         if l + 1 == nl {
                             t.note_decode();
                         }
