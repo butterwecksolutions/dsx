@@ -66,10 +66,20 @@ adaptive replacement (`GpuExperts::begin_swap` / `commit_ready`):
   its lock. With enough pauses the experts in use end up on GPUs and in RAM, and the disk is no longer read.
 
 An adaptive store (`DSX_ADAPT`) may hand any resident back to the CPU at any token, so dsx keeps an arena copy of each
-of them. Tiering keeps that rule: it moves nothing into an adaptive store and never takes its residents' copies.
-Exchanges into an adaptive store were tried and removed: on a 3090 (adaptive) + CMP 170HX they took the CMP off the
-critical path, but the store handed more experts back to the CPU (5.8 -> 8.2 and 6.9 -> 9.2 picks per token) and the
-decode rate did not rise. An exchanged expert rests for 15 minutes before it can be exchanged again.
+of them. Tiering keeps that rule and never takes its residents' copies. Without expert deferral it moves nothing into
+an adaptive store: on a 3090 (adaptive) + CMP 170HX such exchanges took the CMP off the critical path, but the store
+handed more experts back to the CPU (5.8 -> 8.2 and 6.9 -> 9.2 picks per token) and the decode rate did not rise.
+
+With expert deferral (`--defer-rank R` / `DSX_DEFER=R`) the main GPU does not wait for the CPU's picks at rank R or
+lower, so an expert handed back to the CPU costs less. Then:
+
+- picks at a deferred rank count a quarter in the learned usage (`DEFERRED_WEIGHT`): GPU slots go to experts the main
+  GPU would wait for;
+- an aux GPU that is late by more than 40 us per layer (`CLEAR_WAIT_US`) also exchanges its hottest expert with the
+  coldest resident of the adaptive main store. An expert without an arena copy gets one in a pause first;
+- the adaptive store does not hand an exchanged expert back while it rests.
+
+An exchanged expert rests for 15 minutes before it can be exchanged again.
 `adaptive_swaps` in the stats counts an adaptive store's own replacements.
 
 GPUs differ in size and speed. A larger store holds more experts and gets more picks; a slower GPU needs longer for
@@ -181,6 +191,32 @@ Off 38.0, on 42.2 tok/s: +10.9 %. Both B phases lie above both A phases.
 - `token_ms` after the run: 26.1 ms per token, of which the main GPU waits 4.7 ms, computes experts for 1.1 ms and
   spends 20.3 ms on the rest (a difference, not measured by itself). Tiering can only reach the waits.
 - No pick was computed from the file side once the arena had followed use.
+
+### With expert deferral (`--defer-rank 3`)
+
+Same machine, server with `--defer-rank 3` (as in production), `DSX_ADAPT=4` on the 3090. Per-token profile without
+tiering (`DSX_EVPROF=1`): the main GPU spends 13.0 ms on attention and the rest of the layer, 4.4 ms on its own and the
+shared experts, waits 3.1 ms for the CMP and 1.5 ms for the CPU (4.0 ms before deferral).
+
+With deferral the first version of tiering (learned placement and moves, unweighted usage, no exchanges into the
+adaptive store) was within noise: 41.4 / 41.8 / 40.7 / 40.4 tok/s (A / B / A / B, +1.0 %). Deferral hides the same CPU
+wait that the learned placement shortened. Fixing the 3090's set instead (`DSX_ADAPT=0`, so that exchanges could run)
+was 5 % slower: 42.0 / 39.9 / 41.8 / 39.7.
+
+This version, A-B-A-B as above, but each phase first runs 25 minutes of load with 45 s pauses (exchanges and arena
+copies happen in pauses; without them no exchange ran after a restart):
+
+| phase | tiering | median decode tok/s | the 9 rates | exchanges | wait for CMP |
+|---|---|---|---|---|---|
+| A1 | off | 41.1 | 42.2 39.7 41.6 41.3 39.8 40.7 41.9 40.3 41.1 | - | - |
+| B1 | on | 40.9 | 42.8 38.7 40.8 42.2 38.9 40.9 42.7 40.5 41.7 | 746 | 36 us/layer |
+| A2 | off | 41.3 | 42.4 40.9 41.2 42.3 40.9 41.3 42.0 41.2 41.4 | - | - |
+| B2 | on | 42.6 | 43.3 42.0 42.1 43.4 40.8 42.6 43.3 41.3 42.7 | 721 | 31 us/layer |
+
+Off 41.2, on 42.0 tok/s: +1.9 %. The phases overlap, so this is not an established gain. The exchanges halve the wait
+for the CMP (about 70 -> 31-36 us per layer), but the work moves to the 3090, which is on the critical path anyway, and
+to the CPU. B2, after B1's learning was saved, is the fastest phase; single runs reach 43.4 against 42.4 without
+tiering. Whether that holds with a longer-learned state is open.
 
 To repeat it: start the server twice with the same arguments, once with `DSX_TIER=0`, alternate A-B-A-B with a
 restart per phase, and compare `decode_tok_s` of the same requests. `DSX_TIER=0` leaves the state on disk untouched.
