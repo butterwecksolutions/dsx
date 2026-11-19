@@ -1179,6 +1179,96 @@ extern "C" __global__ void gemv_fp8b32(const uint8_t *__restrict__ w, const floa
     }
 }
 
+// DSpark's routed experts: checkpoint FP4 E2M1 (two per byte, low nibble first) with an E8M0 scale per 32 columns of
+// each row, against FP8-fake-quantized activations (the caller's fake_fp8_copy). Layout and launch as gemv_fp8b32:
+// 4 rows per warp, 16 per block of 128, lane l takes 16 columns at l*16 + 512*i; the scale applies per 16-column part.
+__device__ __forceinline__ float e2m1_val(unsigned n) {
+  unsigned m = n & 7;
+  float v = m < 2 ? 0.5f * (float)m : 0.5f * (float)((2u + (m & 1u)) << ((m >> 1) - 1));
+  return (n & 8) ? -v : v;
+}
+extern "C" __global__ void gemv_fp4(const uint8_t *__restrict__ w, const float *__restrict__ x, float *__restrict__ y,
+                                    int rows, int k, int T, int ldx, int ldy, const uint8_t *__restrict__ scale) {
+  int r0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * FP8_ROWS, lane = threadIdx.x & 31;
+  if (r0 >= rows) return;
+  int nb = k / 32;
+  float acc[FP8_ROWS][MAXT];
+#pragma unroll
+  for (int q = 0; q < FP8_ROWS; q++)
+#pragma unroll
+    for (int t = 0; t < MAXT; t++) acc[q][t] = 0.f;
+  for (int i = lane * 16; i < k; i += 512) {
+    float wv[FP8_ROWS][16], d[FP8_ROWS];
+#pragma unroll
+    for (int q = 0; q < FP8_ROWS; q++) {
+      int r = min(r0 + q, rows - 1);
+      uint2 a = *(const uint2 *)(w + (size_t)r * (k / 2) + i / 2);
+      d[q] = __uint_as_float((uint32_t)scale[(size_t)r * nb + i / 32] << 23);
+      const uint8_t *b = (const uint8_t *)&a;
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        wv[q][2 * j] = e2m1_val(b[j] & 15u);
+        wv[q][2 * j + 1] = e2m1_val(b[j] >> 4);
+      }
+    }
+#pragma unroll
+    for (int t = 0; t < MAXT; t++) {
+      if (t < T) {
+        const float4 *xp = (const float4 *)(x + (size_t)t * ldx + i);
+        float4 xv[4] = {xp[0], xp[1], xp[2], xp[3]};
+        const float *xf = (const float *)xv;
+#pragma unroll
+        for (int q = 0; q < FP8_ROWS; q++) {
+          float s = 0.f;
+#pragma unroll
+          for (int j = 0; j < 16; j++) s += wv[q][j] * xf[j];
+          acc[q][t] += d[q] * s;
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int q = 0; q < FP8_ROWS; q++)
+#pragma unroll
+    for (int t = 0; t < MAXT; t++) {
+      if (t < T) {
+        float s = warp_sum(acc[q][t]);
+        if (lane == 0 && r0 + q < rows) y[(size_t)t * ldy + r0 + q] = s;
+      }
+    }
+}
+
+// DSpark head: argmax over n of logits + bias (first index on ties, as the CPU reference); one block of 1024
+extern "C" __global__ void dsp_argmax_add(const float *logits, const float *bias, int n, int *out) {
+  __shared__ float sv[32];
+  __shared__ int si[32];
+  float bv = -INFINITY;
+  int bi = 0x7fffffff;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    float v = logits[i] + bias[i];
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+    int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+  }
+  int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+  if (lane == 0) { sv[wid] = bv; si[wid] = bi; }
+  __syncthreads();
+  if (wid == 0) {
+    int nw = blockDim.x >> 5;
+    bv = lane < nw ? sv[lane] : -INFINITY;
+    bi = lane < nw ? si[lane] : 0x7fffffff;
+    for (int o = 16; o > 0; o >>= 1) {
+      float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+      int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+      if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if (lane == 0) *out = bi == 0x7fffffff ? 0 : bi;
+  }
+}
+
 extern "C" __global__ void gemv_bf16(const __nv_bfloat16 *__restrict__ w, const float *__restrict__ x, float *__restrict__ y,
                                      int rows, int k, int T, int ldx, int ldy) {
   int r = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;

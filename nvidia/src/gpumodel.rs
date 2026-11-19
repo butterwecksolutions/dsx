@@ -8,8 +8,10 @@ use crate::model::{Mat, Model, dot, matvec};
 use crate::numerics::{round_bf16, silu};
 use anyhow::{Context, Result, bail};
 
+mod dspark;
 mod prefill;
 mod vision;
+pub use dspark::DsparkGpu;
 pub use vision::{VisionWeights, encode_image};
 pub use prefill::PrefillBufs;
 use std::collections::HashMap;
@@ -44,7 +46,9 @@ impl DMat {
             return (self.buf.ptr + (r0 * self.cols) as u64, self.scale.as_ref().unwrap().ptr + (r0 * (self.cols / 32) * 2) as u64, 1008);
         }
         let rb = self.ty.row_bytes(self.cols);
-        let sp = self.scale.as_ref().map_or(0, |s| s.ptr + (r0 / 32 * (self.cols / 32)) as u64);
+        // FP8: one scale row per 32 weight rows; FP4: one per weight row
+        let srow = if self.ty == GType::Fp4 { r0 } else { r0 / 32 };
+        let sp = self.scale.as_ref().map_or(0, |s| s.ptr + (srow * (self.cols / 32)) as u64);
         let id = if self.ty == GType::Fp8B32 { 1000 } else { self.ty as u32 as i32 };
         (self.buf.ptr + (r0 * rb) as u64, sp, id)
     }
@@ -312,7 +316,7 @@ pub struct Placement {
 pub const KERNELS: &[&str] = &[
     "gemv_q8_0", "gemv_f16", "gemv_f32", "rmsnorm", "round_bf16", "rope", "fake_fp8", "fake_fp4", "hc_mixes", "hc_pre",
     "hc_post", "sparse_attn", "sparse_attn_tile", "sparse_attn_merge", "store_bf16", "indexer_score", "compress_pool", "router_topk", "swiglu", "add_inplace",
-    "engram_gate", "scale_bf16", "gemv_fp8b32", "gemv_fp8b32_o", "gemv_bf16", "fake_fp8_copy", "gemv_q2_0", "gemv_ptq1_0", "gemv_q3_k", "publish_route", "combine_experts", "spin_wait", "rope_pos", "compress_pairs", "gather_f16", "swiglu_rows_f16", "scatter_add", "engram_gate_t", "dequant_f16", "dequant_f16_iq8", "dequant_t16_f16", "t16_pre", "t16_post", "to_f16", "ring_scatter", "pack_f16", "gemv_q8r", "gemv_q8r4", "hc_dots", "hc_dots_t", "hc_finish", "hc_finish_w", "gemv_q8g", "hc_pre_mb", "hc_post_mb", "to_bf16", "gemv_q8r_sk", "gemv_f16_sk", "gemv_bf16_sk", "gemv_f32_sk", "hc_part", "hc_reduce", "gemv_q6p", "dequant_q6p_f16", "gemv_q5p", "dequant_q5p_f16", "gemv_q6g4", "gemv_q6g8", "gemv_q6s8", "gemv_q5p4",
+    "engram_gate", "scale_bf16", "gemv_fp8b32", "gemv_fp8b32_o", "gemv_fp4", "dsp_argmax_add", "gemv_bf16", "fake_fp8_copy", "gemv_q2_0", "gemv_ptq1_0", "gemv_q3_k", "publish_route", "combine_experts", "spin_wait", "rope_pos", "compress_pairs", "gather_f16", "swiglu_rows_f16", "scatter_add", "engram_gate_t", "dequant_f16", "dequant_f16_iq8", "dequant_t16_f16", "t16_pre", "t16_post", "to_f16", "ring_scatter", "pack_f16", "gemv_q8r", "gemv_q8r4", "hc_dots", "hc_dots_t", "hc_finish", "hc_finish_w", "gemv_q8g", "hc_pre_mb", "hc_post_mb", "to_bf16", "gemv_q8r_sk", "gemv_f16_sk", "gemv_bf16_sk", "gemv_f32_sk", "hc_part", "hc_reduce", "gemv_q6p", "dequant_q6p_f16", "gemv_q5p", "dequant_q5p_f16", "gemv_q6g4", "gemv_q6g8", "gemv_q6s8", "gemv_q5p4",
     "fwht_rows_f16", "hc_reduce_finish", "kv_norm_rope_store", "add_noise_rows", "hc_add_post", "hc_pre_norm", "router_publish", "gemv_q8r1", "gemv_bf16_sk1", "gemv_f16_sk1", "gemv_q8r_sk1", "combine_post", "gemv_q8g_bf", "gemv_q8r_gu", "sparse_attn_merge_rf", "gemv_q8r1_rope", "gemv_q8r1_post", "vit_rmsnorm", "vit_bias_add", "vit_rope_split", "vit_softmax", "vit_heads_merge", "vit_swiglu", "vit_unfold3", "vit_gelu_bias", "vit_to_bf16",
 ];
 
@@ -1597,6 +1601,7 @@ impl<'m> GpuModel<'m> {
             // arithmetic, bit-identical to the F16 path
             GType::Fp8B32 if !w.act_fp8 => "gemv_fp8b32_o",
             GType::Fp8B32 => "gemv_fp8b32",
+            GType::Fp4 => "gemv_fp4",
             GType::Q2_0 => "gemv_q2_0",
             GType::Ptq1_0 => "gemv_ptq1_0",
             GType::Q3K => "gemv_q3_k",
@@ -1623,7 +1628,7 @@ impl<'m> GpuModel<'m> {
             "gemv_q8r_sk" if t == 1 && self.sk1 => "gemv_q8r_sk1",
             k => k,
         };
-        let per_block = if sk { 1 } else if matches!(kname, "gemv_q8r4" | "gemv_fp8b32") { 16 } else { 4 };
+        let per_block = if sk { 1 } else if matches!(kname, "gemv_q8r4" | "gemv_fp8b32" | "gemv_fp4") { 16 } else { 4 };
         self.g.launch(
             self.k[kname],
             ((n as u32).div_ceil(per_block), 1, 1),

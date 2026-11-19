@@ -567,18 +567,18 @@ impl GpuModel<'_> {
         g.gemm_f16(pb.act16.ptr, pb.w16.ptr, y, n, cols, rows, rows)
     }
 
-    fn hc_mixes_rows(&self, fnw: &(DMat, Buf, Buf), h: u64, out: u64, n: usize) -> Result<()> {
+    pub(super) fn hc_mixes_rows(&self, fnw: &(DMat, Buf, Buf), h: u64, out: u64, n: usize) -> Result<()> {
         let c = &self.m.cfg;
         // tiled: 4 rows x 4 tokens per block, the same dots as hc_dots
         self.g.launch(self.k["hc_dots_t"], (6, (n as u32).div_ceil(4), 1), 256, 0, &[Arg::P(fnw.0.buf.ptr), Arg::P(h), Arg::P(out), Arg::I((c.hc * c.dim) as i32), Arg::F(c.eps), Arg::I(n as i32)])?;
         self.g.launch(self.k["hc_finish_w"], ((n as u32).div_ceil(4), 1, 1), 128, 0, &[Arg::P(out), Arg::P(fnw.1.ptr), Arg::P(fnw.2.ptr), Arg::F(c.hc_eps), Arg::I(c.sinkhorn_iters as i32), Arg::I(n as i32)])
     }
 
-    fn rms_rows(&self, x: u64, w: &Buf, out: u64, n: usize, rows: usize, round: bool) -> Result<()> {
+    pub(super) fn rms_rows(&self, x: u64, w: &Buf, out: u64, n: usize, rows: usize, round: bool) -> Result<()> {
         self.g.launch(self.k["rmsnorm"], (rows as u32, 1, 1), 1024, 0, &[Arg::P(x), Arg::P(w.ptr), Arg::P(out), Arg::I(n as i32), Arg::I(n as i32), Arg::I(n as i32), Arg::F(self.m.cfg.eps), Arg::I(round as i32)])
     }
 
-    fn rope_rows(&self, x: u64, heads: usize, hd: usize, compressed: bool, pos: u64, rows: usize, inverse: bool) -> Result<()> {
+    pub(super) fn rope_rows(&self, x: u64, heads: usize, hd: usize, compressed: bool, pos: u64, rows: usize, inverse: bool) -> Result<()> {
         let f = if compressed { &self.freqs.1 } else { &self.freqs.0 };
         self.g.launch(self.k["rope_pos"], (rows as u32, 1, 1), 256, 0, &[Arg::P(x), Arg::P(f.ptr), Arg::I(heads as i32), Arg::I(hd as i32), Arg::I(self.m.cfg.rope_dim as i32), Arg::I((heads * hd) as i32), Arg::P(pos), Arg::I(inverse as i32)])
     }

@@ -67,6 +67,12 @@ enum Cmd {
         arena_gb: f64,
         #[arg(long)]
         rank: Option<PathBuf>,
+        /// draft on the main GPU (DSpark stack uploaded next to the model) instead of the CPU reference
+        #[arg(long)]
+        gpu: bool,
+        /// with --gpu: also draft with the CPU reference for the first N tokens and compare
+        #[arg(long, default_value_t = 0)]
+        check_cpu: usize,
     },
     /// Prefill a prompt in chunks, then decode greedily; --check also runs the prompt token by token and compares.
     #[cfg(feature = "cuda")]
@@ -348,7 +354,7 @@ fn main() -> Result<()> {
             println!("generated ids: {seq:?}");
         }
         #[cfg(feature = "cuda")]
-        Cmd::SpecDraft { model, engram, mtp, ids, n, ctx, gpu0_gb, gpu1_gb, arena_gb, rank } => {
+        Cmd::SpecDraft { model, engram, mtp, ids, n, ctx, gpu0_gb, gpu1_gb, arena_gb, rank, gpu, check_cpu } => {
             let ids: Vec<u32> = match ids.strip_prefix('@') {
                 Some(f) => std::fs::read_to_string(f)?,
                 None => ids,
@@ -363,26 +369,60 @@ fn main() -> Result<()> {
             let ds = dsx::dspark::Dspark::load(&m, &st, &mtp)?;
             let mut gm = dsx::gpumodel::GpuModel::with_placement(&m, -1, ctx, dsx::gpumodel::Placement { gpu0_gb, aux_gb: gpu1_gb, arena_gb, prefill_chunk: 0, rank })?;
             gm.capture_hidden(&ds.targets)?;
+            let mut dg = if gpu {
+                let tg = Instant::now();
+                let dg = dsx::gpumodel::DsparkGpu::load(&gm, &mtp)?;
+                eprintln!("DSpark on the GPU: {:.2} GB in {:.1} s", dg.bytes as f64 / 1e9, tg.elapsed().as_secs_f32());
+                Some(dg)
+            } else {
+                None
+            };
             eprintln!("loaded in {:.1} s; draft block {}, targets {:?}", t0.elapsed().as_secs_f32(), ds.block, ds.targets);
+            let cpu_ref = !gpu || check_cpu > 0;
             let mut dst = ds.new_state(&m);
             let mut logits = vec![];
             for &tok in &ids {
                 logits = gm.step(tok)?;
-                ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+                if cpu_ref {
+                    ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+                }
+                if let Some(dg) = dg.as_mut() {
+                    dg.observe(&gm, gm.pos - 1)?;
+                }
             }
+            let (mut cmp_n, mut cmp_same, mut cmp_lead, mut cmp_conf) = (0usize, 0usize, 0usize, 0f64);
             let (mut drafts, mut seq): (Vec<(usize, Vec<u32>, Vec<f32>)>, Vec<u32>) = (vec![], vec![]);
             let (mut t_draft, mut t_step) = (0f64, 0f64);
             for _ in 0..n {
                 let next = top(&logits, 1)[0].0;
+                let i = seq.len();
                 let t = Instant::now();
-                let (d, cf) = ds.draft(&m, &dst, gm.pos - 1, next);
+                let (d, cf) = match dg.as_mut() {
+                    Some(dg) => dg.draft(&gm, gm.pos - 1, next)?,
+                    None => ds.draft(&m, &dst, gm.pos - 1, next),
+                };
                 t_draft += t.elapsed().as_secs_f64();
+                if gpu && i < check_cpu {
+                    let (dc, cc) = ds.draft(&m, &dst, gm.pos - 1, next);
+                    cmp_n += 1;
+                    cmp_same += (dc == d) as usize;
+                    cmp_lead += dc.iter().zip(&d).take_while(|(a, b)| a == b).count();
+                    cmp_conf = cmp_conf.max(cc.iter().zip(&cf).map(|(a, b)| (a - b).abs() as f64).fold(0.0, f64::max));
+                    if dc != d {
+                        eprintln!("draft {i}: gpu {d:?} cpu {dc:?}");
+                    }
+                }
                 drafts.push((seq.len() + 1, d, cf));
                 seq.push(next);
                 let t = Instant::now();
                 logits = gm.step(next)?;
                 t_step += t.elapsed().as_secs_f64();
-                ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+                if cpu_ref && (!gpu || seq.len() < check_cpu) {
+                    ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+                }
+                if let Some(dg) = dg.as_mut() {
+                    dg.observe(&gm, gm.pos - 1)?;
+                }
             }
             // per draft: how many leading drafts match what the model produced (only drafts that end inside the run)
             let scored: Vec<(usize, &Vec<f32>)> = drafts
@@ -400,7 +440,10 @@ fn main() -> Result<()> {
             let reach = |i: usize| scored.iter().filter(|(a, _)| *a >= i).count() as f64;
             let cond: Vec<f64> = (1..=ds.block).map(|i| (reach(i) / reach(i - 1).max(1.0) * 1000.0).round() / 1000.0).collect();
             println!("dspark: {} drafts scored, accepted histogram {hist:?}, mean {mean:.2} of {}; hit rate per position given the previous hit {cond:?}", scored.len(), ds.block);
-            println!("timing: main step {:.1} ms/token, CPU draft {:.1} ms/draft (reference code, not tuned)", t_step * 1e3 / n as f64, t_draft * 1e3 / n as f64);
+            if cmp_n > 0 {
+                println!("gpu vs cpu draft: {cmp_same}/{cmp_n} identical, {:.2} of {} leading tokens agree on average, max |conf diff| {cmp_conf:.4}", cmp_lead as f64 / cmp_n as f64, ds.block);
+            }
+            println!("timing: main step {:.1} ms/token, {} draft {:.2} ms/draft", t_step * 1e3 / n as f64, if gpu { "GPU" } else { "CPU reference" }, t_draft * 1e3 / n as f64);
             let rows: Vec<String> = scored
                 .iter()
                 .map(|(a, cf)| format!("[{a},[{}]]", cf.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(",")))
