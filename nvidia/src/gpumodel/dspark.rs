@@ -87,7 +87,9 @@ pub struct DsparkGpu {
     main_proj: DMat,
     main_norm: Buf,
     norm: Buf,
+    /// rows read on the host per drafted token; points into `_st`'s mapping, which must outlive it
     markov_embed: Mat,
+    _st: SafeTensors,
     markov_head: DMat,
     conf: Vec<f32>,
     b: Bufs,
@@ -214,6 +216,7 @@ impl DsparkGpu {
             markov_head,
             conf: v(&format!("mtp.{last}.confidence_head.proj.weight"))?,
             markov_embed,
+            _st: st,
             b: bufs,
             block,
             noise: t["dspark_noise_token_id"].as_u64().unwrap_or(128799) as u32,
