@@ -754,6 +754,11 @@ impl GpuModel<'_> {
                     *self.prof.as_mut().unwrap().entry("prefill engram").or_default() += tq.elapsed().as_secs_f64();
                 }
             }
+            if let (true, Some(k), Some(b)) = (self.verify_t > 0, self.hid_layers.iter().position(|&x| x == li), self.hid_buf.as_ref()) {
+                // DSpark: a verify pass's residuals at a target layer, row t per token (as `step` does for one)
+                let row = hc * d * 4;
+                self.g.dtod(b.ptr + (k * crate::handoff::MAXT * row) as u64, pb.h.ptr, tn * row)?;
+            }
             let hrow = |base: u64, width: usize| base + (r0 * width * 4) as u64;
             // attention half
             let l = &self.layers[li];

@@ -2101,10 +2101,11 @@ impl<'m> GpuModel<'m> {
         Ok(())
     }
 
-    /// DSpark: from now on every `step` copies the residual entering each of `layers` aside; `main_hidden` reads it.
+    /// DSpark: from now on every `step` (row 0) and every verify pass (row t per token) copies the residual entering
+    /// each of `layers` aside ([layer][MAXT][hc][dim]); `main_hidden` and DsparkGpu::observe_row read it.
     pub fn capture_hidden(&mut self, layers: &[usize]) -> Result<()> {
         let c = &self.m.cfg;
-        self.hid_buf = if layers.is_empty() { None } else { Some(self.g.alloc(layers.len() * c.hc * c.dim * 4)?) };
+        self.hid_buf = if layers.is_empty() { None } else { Some(self.g.alloc(layers.len() * crate::handoff::MAXT * c.hc * c.dim * 4)?) };
         self.hid_layers = layers.to_vec();
         Ok(())
     }
@@ -2113,9 +2114,10 @@ impl<'m> GpuModel<'m> {
     pub fn main_hidden(&self) -> Result<Vec<f32>> {
         let (c, b) = (&self.m.cfg, self.hid_buf.as_ref().context("capture_hidden not called")?);
         let (d, hc) = (c.dim, c.hc);
-        let raw: Vec<f32> = self.g.download(b.ptr, self.hid_layers.len() * hc * d)?;
+        let raw: Vec<f32> = self.g.download(b.ptr, self.hid_layers.len() * crate::handoff::MAXT * hc * d)?;
         Ok(raw
-            .chunks(hc * d)
+            .chunks(crate::handoff::MAXT * hc * d)
+            .map(|c| &c[..hc * d])
             .flat_map(|h| (0..d).map(move |i| crate::numerics::round_bf16((0..hc).map(|k| h[k * d + i]).sum::<f32>() / hc as f32)))
             .collect())
     }
@@ -2273,7 +2275,7 @@ impl<'m> GpuModel<'m> {
             if let (Some(k), Some(b)) = (self.hid_layers.iter().position(|&x| x == li), self.hid_buf.as_ref()) {
                 // DSpark reads the residual entering this layer's attention (after Engram), as the CPU reference
                 let row = c.hc * d * 4;
-                self.g.dtod(b.ptr + (k * row) as u64, self.h.ptr, row)?;
+                self.g.dtod(b.ptr + (k * crate::handoff::MAXT * row) as u64, self.h.ptr, row)?;
             }
             self.ev(li, 8)?;
             // attention half: mixes for this sublayer; input collapsed with the previous FFN's pre

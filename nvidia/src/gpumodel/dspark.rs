@@ -89,6 +89,27 @@ struct Bufs {
     kvo: Buf,     // [hd]
 }
 
+/// per-section timing of one draft (synchronizes at every mark when on)
+struct Prof {
+    on: bool,
+    t: std::time::Instant,
+    v: Vec<(&'static str, f64)>,
+}
+
+impl Prof {
+    fn mark(&mut self, g: &Gpu, name: &'static str) {
+        if self.on {
+            let _ = g.sync();
+            let e = self.t.elapsed().as_secs_f64();
+            match self.v.iter_mut().find(|(k, _)| *k == name) {
+                Some(x) => x.1 += e,
+                None => self.v.push((name, e)),
+            }
+            self.t = std::time::Instant::now();
+        }
+    }
+}
+
 pub struct DsparkGpu {
     layers: Vec<DLayer>,
     main_proj: DMat,
@@ -107,6 +128,10 @@ pub struct DsparkGpu {
     ne: usize,
     /// device memory the stack took (weights and scratch)
     pub bytes: usize,
+    ring_saved: Vec<Buf>,
+    prof_on: bool,
+    prof: Vec<(&'static str, f64)>,
+    prof_n: usize,
 }
 
 fn up(g: &Gpu, w: &Mat) -> Result<DMat> {
@@ -252,23 +277,31 @@ impl DsparkGpu {
             top_k,
             ne,
             bytes: 0,
+            ring_saved: vec![],
+            prof_on: std::env::var_os("DSX_DSPARK_PROF").is_some(),
+            prof: vec![],
+            prof_n: 0,
         };
         anyhow::ensure!(ds.targets.len() == 3, "DSpark reads 3 target layers, config has {:?}", ds.targets);
         let (free1, _) = g.mem_info()?;
         Ok(DsparkGpu { bytes: free0.saturating_sub(free1), ..ds })
     }
 
-    /// The main model just processed position `pos` (its `step` captured the target layers' residuals): project them
-    /// into every draft layer's window ring (the reference `observe`).
-    pub fn observe(&mut self, gm: &GpuModel, pos: usize) -> Result<()> {
+    /// The main model just processed position `pos` (its `step` captured row 0, a verify pass row t per token, of
+    /// the target layers' residuals): project row `t` into every draft layer's window ring (the reference `observe`).
+    pub fn observe_row(&mut self, gm: &GpuModel, pos: usize, t: usize) -> Result<()> {
         let c = &gm.m.cfg;
         let (d, hd, w) = (c.dim, c.head_dim, c.window);
         let hid = gm.hid_buf.as_ref().context("capture_hidden(targets) first")?;
         anyhow::ensure!(gm.hid_layers == self.targets, "captured layers {:?}, DSpark reads {:?}", gm.hid_layers, self.targets);
+        anyhow::ensure!(t < crate::handoff::MAXT, "observe row {t}");
         let g = &gm.g;
         let b = &self.b;
+        let row = c.hc * d * 4;
         // main_hidden: per target layer the mean of the hc streams, bf16 (hc_pre with 1/4 weights rounds)
-        g.launch(gm.k["hc_pre"], (3, 1, 1), 256, 0, &[Arg::P(hid.ptr), Arg::P(b.mhmix.ptr), Arg::I(0), Arg::P(b.mh.ptr), Arg::I(d as i32)])?;
+        for k in 0..3 {
+            g.launch(gm.k["hc_pre"], (1, 1, 1), 256, 0, &[Arg::P(hid.ptr + ((k * crate::handoff::MAXT + t) * row) as u64), Arg::P(b.mhmix.ptr), Arg::I(0), Arg::P(b.mh.ptr + (k * d * 4) as u64), Arg::I(d as i32)])?;
+        }
         gm.gemv(&self.main_proj, b.mh.ptr, b.mx.ptr)?;
         gm.rmsnorm(b.mx.ptr, &self.main_norm, b.mx.ptr, d, true)?;
         if dbg() {
@@ -281,6 +314,43 @@ impl DsparkGpu {
         Ok(())
     }
 
+    pub fn observe(&mut self, gm: &GpuModel, pos: usize) -> Result<()> {
+        self.observe_row(gm, pos, 0)
+    }
+
+    /// Copy the window rings aside / back (with GpuModel::snapshot / restore)
+    pub fn save_rings(&mut self, gm: &GpuModel) -> Result<()> {
+        let n = gm.m.cfg.window * gm.m.cfg.head_dim * 2;
+        if self.ring_saved.is_empty() {
+            for _ in &self.layers {
+                self.ring_saved.push(gm.g.alloc(n)?);
+            }
+        }
+        for (l, s) in self.layers.iter().zip(&self.ring_saved) {
+            gm.g.dtod(s.ptr, l.ring.ptr, n)?;
+        }
+        Ok(())
+    }
+
+    pub fn restore_rings(&self, gm: &GpuModel) -> Result<()> {
+        let n = gm.m.cfg.window * gm.m.cfg.head_dim * 2;
+        for (l, s) in self.layers.iter().zip(&self.ring_saved) {
+            gm.g.dtod(l.ring.ptr, s.ptr, n)?;
+        }
+        Ok(())
+    }
+
+    /// section timing on/off (it synchronizes per section, so speed runs turn it off)
+    pub fn set_prof(&mut self, on: bool) {
+        self.prof_on = on;
+    }
+
+    /// DSX_DSPARK_PROF=1: milliseconds per draft section (each section synchronized), averaged
+    pub fn prof_report(&self) -> String {
+        let n = self.prof_n.max(1) as f64;
+        self.prof.iter().map(|(k, v)| format!("{k} {:.2}", v * 1e3 / n)).collect::<Vec<_>>().join(", ")
+    }
+
     /// Draft `block` tokens after position `pos`, whose next token (sampled by the main model, not yet fed) is
     /// `next`. Returns (drafts, confidence): drafts[i] is the guess for position pos + 2 + i.
     pub fn draft(&mut self, gm: &GpuModel, pos: usize, next: u32) -> Result<(Vec<u32>, Vec<f32>)> {
@@ -291,6 +361,11 @@ impl DsparkGpu {
         let g = &gm.g;
         let b = &self.b;
         let f4 = |n: usize| n * 4;
+        let mut pf = Prof { on: self.prof_on, t: std::time::Instant::now(), v: vec![] };
+        if pf.on {
+            let _ = g.sync();
+            pf.t = std::time::Instant::now();
+        }
         // inputs: embeddings (next, then noise), one-hot pre mixes, positions, window rows in use
         let mut h = vec![0f32; bl * hc * d];
         let mut e = vec![0f32; d];
@@ -311,6 +386,7 @@ impl DsparkGpu {
         let widx: Vec<i32> = (0..bl * w).map(|j| if j % w < nwin { (j % w) as i32 } else { -1 }).collect();
         g.htod_sync(b.win_idx.ptr, &widx)?;
         let gsz = nh * hd / c.o_groups;
+        pf.mark(g, "setup");
         for l in &self.layers {
             // attention half, all block rows together
             gm.hc_mixes_rows(&l.hc_attn, b.h.ptr, b.mix_a.ptr, bl)?;
@@ -339,6 +415,7 @@ impl DsparkGpu {
             g.launch(gm.k["round_bf16"], (((bl * rw) as u32).div_ceil(256), 1, 1), 256, 0, &[Arg::P(b.r.ptr), Arg::I((bl * rw) as i32)])?;
             gm.gemv_t(&l.o_b, b.r.ptr, b.a.ptr, bl)?;
             g.launch(gm.k["hc_post"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.a.ptr), Arg::P(b.mix_a.ptr), Arg::I(d as i32)])?;
+            pf.mark(g, "attention");
             if dbg() {
                 let li = self.layers.iter().position(|x| std::ptr::eq(x, l)).unwrap();
                 eprintln!("dspark-dbg gpu L{li}: attn out0 {:.4} h0 {:.4} h4 {:.4}", dn(g, b.a.ptr, 0, d), dn(g, b.h.ptr, 0, hc * d), dn(g, b.h.ptr, (bl - 1) * hc * d, hc * d));
@@ -347,7 +424,9 @@ impl DsparkGpu {
             g.launch(gm.k["hc_pre"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.mix_a.ptr), Arg::I(0), Arg::P(b.x.ptr), Arg::I(d as i32)])?;
             gm.hc_mixes_rows(&l.hc_ffn, b.h.ptr, b.mix_f.ptr, bl)?;
             gm.rms_rows(b.x.ptr, &l.ffn_norm, b.x.ptr, d, bl, true)?;
+            pf.mark(g, "ffn mixes");
             self.moe(gm, l, bl, k, inter)?;
+            pf.mark(g, "moe");
             g.launch(gm.k["hc_post"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.a.ptr), Arg::P(b.mix_f.ptr), Arg::I(d as i32)])?;
             if dbg() {
                 let li = self.layers.iter().position(|x| std::ptr::eq(x, l)).unwrap();
@@ -358,6 +437,7 @@ impl DsparkGpu {
         g.launch(gm.k["hc_pre"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.mix_f.ptr), Arg::I(0), Arg::P(b.x.ptr), Arg::I(d as i32)])?;
         gm.rms_rows(b.x.ptr, &self.norm, b.x.ptr, d, bl, false)?;
         gm.gemv_t(&gm.head, b.x.ptr, b.logits.ptr, bl)?;
+        pf.mark(g, "head logits");
         // in order on the device: Markov embedding of the previous token, its bias over the vocabulary, greedy
         let rank = self.markov_embed.cols;
         let hv = gm.head.rows; // logits row stride (the head's rows; an export may pad the vocabulary)
@@ -369,6 +449,7 @@ impl DsparkGpu {
             gm.gemv(&self.markov_head, emb, b.bias.ptr)?;
             g.launch(gm.k["dsp_argmax_add"], (1, 1, 1), 1024, 0, &[Arg::P(b.logits.ptr + f4(i * hv) as u64), Arg::P(b.bias.ptr), Arg::I(nv as i32), Arg::P(b.toks.ptr + f4(i + 1) as u64)])?;
         }
+        pf.mark(g, "markov chain");
         let toks: Vec<i32> = g.download(b.toks.ptr, bl + 1)?;
         let xs: Vec<f32> = g.download(b.x.ptr, bl * d)?;
         let embs: Vec<f32> = g.download(b.embs.ptr, bl * rank)?;
@@ -382,6 +463,16 @@ impl DsparkGpu {
             }
         }
         let out: Vec<u32> = toks.iter().map(|&x| x as u32).collect();
+        pf.mark(g, "download+conf");
+        if pf.on {
+            self.prof_n += 1;
+            for (k, v) in pf.v {
+                match self.prof.iter_mut().find(|(n, _)| *n == k) {
+                    Some(x) => x.1 += v,
+                    None => self.prof.push((k, v)),
+                }
+            }
+        }
         Ok((out[1..].to_vec(), conf))
     }
 

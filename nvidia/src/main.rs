@@ -52,7 +52,7 @@ enum Cmd {
         /// directory with config.json, model.safetensors.index.json and the shards holding mtp.*
         #[arg(long)]
         mtp: PathBuf,
-        /// prompt token ids, comma separated, or @file
+        /// prompt token ids, comma separated, or @file; several prompts separated by ';'
         #[arg(long)]
         ids: String,
         #[arg(short, default_value_t = 128)]
@@ -73,6 +73,13 @@ enum Cmd {
         /// with --gpu: also draft with the CPU reference for the first N tokens and compare
         #[arg(long, default_value_t = 0)]
         check_cpu: usize,
+        /// with --gpu: afterwards decode the same n tokens speculatively (draft, verify pass, keep the accepted
+        /// prefix) in several variants, against the plain run's tokens and time
+        #[arg(long)]
+        spec: bool,
+        /// prefill buffer rows (verify passes need them)
+        #[arg(long, default_value_t = 128)]
+        chunk: usize,
     },
     /// Prefill a prompt in chunks, then decode greedily; --check also runs the prompt token by token and compares.
     #[cfg(feature = "cuda")]
@@ -354,20 +361,29 @@ fn main() -> Result<()> {
             println!("generated ids: {seq:?}");
         }
         #[cfg(feature = "cuda")]
-        Cmd::SpecDraft { model, engram, mtp, ids, n, ctx, gpu0_gb, gpu1_gb, arena_gb, rank, gpu, check_cpu } => {
-            let ids: Vec<u32> = match ids.strip_prefix('@') {
-                Some(f) => std::fs::read_to_string(f)?,
-                None => ids,
-            }
-            .split(|ch: char| ch == ',' || ch.is_whitespace())
-            .filter(|x| !x.is_empty())
-            .map(|x| x.parse())
-            .collect::<std::result::Result<_, _>>()?;
+        Cmd::SpecDraft { model, engram, mtp, ids, n, ctx, gpu0_gb, gpu1_gb, arena_gb, rank, gpu, check_cpu, spec, chunk } => {
+            // one or more prompts (';' separated, each comma/whitespace ids or @file), measured in one load
+            let prompts: Vec<(String, Vec<u32>)> = ids
+                .split(';')
+                .filter(|x| !x.trim().is_empty())
+                .enumerate()
+                .map(|(i, part)| -> Result<(String, Vec<u32>)> {
+                    let part = part.trim();
+                    let (name, text) = match part.strip_prefix('@') {
+                        Some(f) => (std::path::Path::new(f).file_stem().map_or(format!("p{i}"), |s| s.to_string_lossy().into_owned()), std::fs::read_to_string(f)?),
+                        None => (format!("p{i}"), part.to_string()),
+                    };
+                    let v = text.split(|ch: char| ch == ',' || ch.is_whitespace()).filter(|x| !x.is_empty()).map(|x| x.parse()).collect::<std::result::Result<Vec<u32>, _>>()?;
+                    Ok((name, v))
+                })
+                .collect::<Result<_>>()?;
             let t0 = Instant::now();
             let m = load(&model, engram.as_deref())?;
             let st = dsx::safetensors::SafeTensors::open_prefix(&mtp, "mtp.")?;
             let ds = dsx::dspark::Dspark::load(&m, &st, &mtp)?;
-            let mut gm = dsx::gpumodel::GpuModel::with_placement(&m, -1, ctx, dsx::gpumodel::Placement { gpu0_gb, aux_gb: gpu1_gb, arena_gb, prefill_chunk: 0, rank })?;
+            let chunk = if spec { chunk.max(dsx::handoff::MAXT) } else { 0 };
+            let mut gm = dsx::gpumodel::GpuModel::with_placement(&m, -1, ctx, dsx::gpumodel::Placement { gpu0_gb, aux_gb: gpu1_gb, arena_gb, prefill_chunk: chunk, rank })?;
+            let pb = gm.pb.take();
             gm.capture_hidden(&ds.targets)?;
             let mut dg = if gpu {
                 let tg = Instant::now();
@@ -378,77 +394,145 @@ fn main() -> Result<()> {
                 None
             };
             eprintln!("loaded in {:.1} s; draft block {}, targets {:?}", t0.elapsed().as_secs_f32(), ds.block, ds.targets);
-            let cpu_ref = !gpu || check_cpu > 0;
-            let mut dst = ds.new_state(&m);
-            let mut logits = vec![];
-            for &tok in &ids {
-                logits = gm.step(tok)?;
-                if cpu_ref {
-                    ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
-                }
-                if let Some(dg) = dg.as_mut() {
-                    dg.observe(&gm, gm.pos - 1)?;
-                }
-            }
-            let (mut cmp_n, mut cmp_same, mut cmp_lead, mut cmp_conf) = (0usize, 0usize, 0usize, 0f64);
-            let (mut drafts, mut seq): (Vec<(usize, Vec<u32>, Vec<f32>)>, Vec<u32>) = (vec![], vec![]);
-            let (mut t_draft, mut t_step) = (0f64, 0f64);
-            for _ in 0..n {
-                let next = top(&logits, 1)[0].0;
-                let i = seq.len();
-                let t = Instant::now();
-                let (d, cf) = match dg.as_mut() {
-                    Some(dg) => dg.draft(&gm, gm.pos - 1, next)?,
-                    None => ds.draft(&m, &dst, gm.pos - 1, next),
-                };
-                t_draft += t.elapsed().as_secs_f64();
-                if gpu && i < check_cpu {
-                    let (dc, cc) = ds.draft(&m, &dst, gm.pos - 1, next);
-                    cmp_n += 1;
-                    cmp_same += (dc == d) as usize;
-                    cmp_lead += dc.iter().zip(&d).take_while(|(a, b)| a == b).count();
-                    cmp_conf = cmp_conf.max(cc.iter().zip(&cf).map(|(a, b)| (a - b).abs() as f64).fold(0.0, f64::max));
-                    if dc != d {
-                        eprintln!("draft {i}: gpu {d:?} cpu {dc:?}");
+            for (pname, ids) in &prompts {
+                gm.reset();
+                let cpu_ref = !gpu || check_cpu > 0;
+                let mut dst = ds.new_state(&m);
+                let mut logits = vec![];
+                for &tok in ids {
+                    logits = gm.step(tok)?;
+                    if cpu_ref {
+                        ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+                    }
+                    if let Some(dg) = dg.as_mut() {
+                        dg.observe(&gm, gm.pos - 1)?;
                     }
                 }
-                drafts.push((seq.len() + 1, d, cf));
-                seq.push(next);
-                let t = Instant::now();
-                logits = gm.step(next)?;
-                t_step += t.elapsed().as_secs_f64();
-                if cpu_ref && (!gpu || seq.len() < check_cpu) {
-                    ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+                // the state after the prompt, for the speculative runs below
+                let after_prompt = if spec && gpu { Some((gm.snapshot()?, logits.clone())) } else { None };
+                if let (Some(dg), true) = (dg.as_mut(), spec) {
+                    dg.save_rings(&gm)?;
                 }
-                if let Some(dg) = dg.as_mut() {
-                    dg.observe(&gm, gm.pos - 1)?;
+                let (mut cmp_n, mut cmp_same, mut cmp_lead, mut cmp_conf) = (0usize, 0usize, 0usize, 0f64);
+                let (mut drafts, mut seq): (Vec<(usize, Vec<u32>, Vec<f32>)>, Vec<u32>) = (vec![], vec![]);
+                let (mut t_draft, mut t_step) = (0f64, 0f64);
+                for _ in 0..n {
+                    let next = top(&logits, 1)[0].0;
+                    let i = seq.len();
+                    let t = Instant::now();
+                    let (d, cf) = match dg.as_mut() {
+                        Some(dg) => dg.draft(&gm, gm.pos - 1, next)?,
+                        None => ds.draft(&m, &dst, gm.pos - 1, next),
+                    };
+                    t_draft += t.elapsed().as_secs_f64();
+                    if gpu && i < check_cpu {
+                        let (dc, cc) = ds.draft(&m, &dst, gm.pos - 1, next);
+                        cmp_n += 1;
+                        cmp_same += (dc == d) as usize;
+                        cmp_lead += dc.iter().zip(&d).take_while(|(a, b)| a == b).count();
+                        cmp_conf = cmp_conf.max(cc.iter().zip(&cf).map(|(a, b)| (a - b).abs() as f64).fold(0.0, f64::max));
+                        if dc != d {
+                            eprintln!("{pname} draft {i}: gpu {d:?} cpu {dc:?}");
+                        }
+                    }
+                    drafts.push((seq.len() + 1, d, cf));
+                    seq.push(next);
+                    let t = Instant::now();
+                    logits = gm.step(next)?;
+                    t_step += t.elapsed().as_secs_f64();
+                    if cpu_ref && (!gpu || seq.len() < check_cpu) {
+                        ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+                    }
+                    if let Some(dg) = dg.as_mut() {
+                        dg.observe(&gm, gm.pos - 1)?;
+                    }
                 }
+                // per draft: how many leading drafts match what the model produced (only drafts that end inside the run)
+                let scored: Vec<(usize, &Vec<f32>)> = drafts
+                    .iter()
+                    .filter(|(start, d, _)| start + d.len() <= seq.len())
+                    .map(|(start, d, cf)| (d.iter().zip(&seq[*start..]).take_while(|(a, b)| a == b).count(), cf))
+                    .collect();
+                let mut hist = vec![0usize; ds.block + 1];
+                for (a, _) in &scored {
+                    hist[*a] += 1;
+                }
+                let tot = scored.len().max(1) as f64;
+                let mean = scored.iter().map(|(a, _)| *a).sum::<usize>() as f64 / tot;
+                let reach = |i: usize| scored.iter().filter(|(a, _)| *a >= i).count() as f64;
+                let cond: Vec<f64> = (1..=ds.block).map(|i| (reach(i) / reach(i - 1).max(1.0) * 1000.0).round() / 1000.0).collect();
+                println!("[{pname}] dspark: {} drafts scored, accepted histogram {hist:?}, mean {mean:.2} of {}; hit rate per position given the previous hit {cond:?}", scored.len(), ds.block);
+                if cmp_n > 0 {
+                    println!("[{pname}] gpu vs cpu draft: {cmp_same}/{cmp_n} identical, {:.2} of {} leading tokens agree on average, max |conf diff| {cmp_conf:.4}", cmp_lead as f64 / cmp_n as f64, ds.block);
+                }
+                let (step_ms, draft_ms) = (t_step * 1e3 / n as f64, t_draft * 1e3 / n as f64);
+                println!("[{pname}] timing: main step {step_ms:.1} ms/token, {} draft {draft_ms:.2} ms/draft", if gpu { "GPU" } else { "CPU reference" });
+                if let Some(dg) = dg.as_ref() {
+                    let r = dg.prof_report();
+                    if !r.is_empty() {
+                        println!("[{pname}] draft sections ms: {r}");
+                    }
+                }
+                let rows: Vec<String> = scored
+                    .iter()
+                    .map(|(a, cf)| format!("[{a},[{}]]", cf.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(",")))
+                    .collect();
+                // speculative decoding for real: draft, one verify pass, keep the accepted prefix, observe it
+                let mut runs: Vec<String> = vec![];
+                if let (Some((snap, lg0)), Some(dg), Some(pb)) = (after_prompt.as_ref(), dg.as_mut(), pb.as_ref()) {
+                    // (name, most drafts per pass, confidence threshold: drafts up to the first one below it)
+                    dg.set_prof(false);
+                    let variants: [(&str, usize, Option<f32>); 6] = [("block 2", 2, None), ("block 3", 3, None), ("block 5", 5, None), ("conf>0", 5, Some(0.0)), ("conf>1", 5, Some(1.0)), ("conf>2", 5, Some(2.0))];
+                    for (vname, maxl, thr) in variants {
+                        gm.restore(snap)?;
+                        dg.restore_rings(&gm)?;
+                        let (mut out, mut passes, mut acc, mut steps, mut verified) = (vec![], 0usize, 0usize, 0usize, 0usize);
+                        let mut next = top(lg0, 1)[0].0;
+                        let t0 = Instant::now();
+                        while out.len() < n {
+                            let room = n - out.len() - 1;
+                            let (d, cf) = dg.draft(&gm, gm.pos - 1, next)?;
+                            let mut l = d.len().min(maxl).min(room).min(dsx::handoff::MAXT - 1);
+                            if let Some(th) = thr {
+                                l = l.min(cf.iter().take_while(|&&c| c >= th).count());
+                            }
+                            if l == 0 {
+                                out.push(next);
+                                let lg = gm.step(next)?;
+                                dg.observe(&gm, gm.pos - 1)?;
+                                next = top(&lg, 1)[0].0;
+                                steps += 1;
+                                continue;
+                            }
+                            let mut toks = vec![next];
+                            toks.extend_from_slice(&d[..l]);
+                            let p0 = gm.pos;
+                            let lv = gm.verify_spec(pb, &toks)?;
+                            let mut j = 0;
+                            while j < l && top(&lv[j], 1)[0].0 == d[j] {
+                                j += 1;
+                            }
+                            gm.keep(1 + j)?;
+                            for r in 0..=j {
+                                dg.observe_row(&gm, p0 + r, r)?;
+                            }
+                            out.push(next);
+                            out.extend_from_slice(&d[..j]);
+                            next = top(&lv[j], 1)[0].0;
+                            passes += 1;
+                            acc += j;
+                            verified += l;
+                        }
+                        let el = t0.elapsed().as_secs_f64();
+                        out.truncate(n);
+                        let same = out.iter().zip(&seq).take_while(|(a, b)| a == b).count();
+                        let tps = n as f64 / el;
+                        println!("[{pname}] spec {vname}: {:.2} tok/s vs plain {:.2} = {:.2}x; {passes} verify passes ({acc}/{verified} drafts accepted), {steps} plain steps; same as plain for the first {same}/{n} tokens", tps, 1e3 / step_ms, tps * step_ms / 1e3);
+                        runs.push(format!("{{\"name\":\"{vname}\",\"tps\":{tps:.3},\"x\":{:.4},\"passes\":{passes},\"accepted\":{acc},\"verified\":{verified},\"steps\":{steps},\"same\":{same}}}", tps * step_ms / 1e3));
+                    }
+                }
+                println!("dspark-json {{\"name\":\"{pname}\",\"block\":{},\"step_ms\":{step_ms:.3},\"draft_ms\":{draft_ms:.3},\"spec\":[{}],\"drafts\":[{}]}}", ds.block, runs.join(","), rows.join(","));
             }
-            // per draft: how many leading drafts match what the model produced (only drafts that end inside the run)
-            let scored: Vec<(usize, &Vec<f32>)> = drafts
-                .iter()
-                .filter(|(start, d, _)| start + d.len() <= seq.len())
-                .map(|(start, d, cf)| (d.iter().zip(&seq[*start..]).take_while(|(a, b)| a == b).count(), cf))
-                .collect();
-            let mut hist = vec![0usize; ds.block + 1];
-            for (a, _) in &scored {
-                hist[*a] += 1;
-            }
-            let tot = scored.len().max(1) as f64;
-            let mean = scored.iter().map(|(a, _)| *a).sum::<usize>() as f64 / tot;
-            // hit rate at draft position i given all before it hit
-            let reach = |i: usize| scored.iter().filter(|(a, _)| *a >= i).count() as f64;
-            let cond: Vec<f64> = (1..=ds.block).map(|i| (reach(i) / reach(i - 1).max(1.0) * 1000.0).round() / 1000.0).collect();
-            println!("dspark: {} drafts scored, accepted histogram {hist:?}, mean {mean:.2} of {}; hit rate per position given the previous hit {cond:?}", scored.len(), ds.block);
-            if cmp_n > 0 {
-                println!("gpu vs cpu draft: {cmp_same}/{cmp_n} identical, {:.2} of {} leading tokens agree on average, max |conf diff| {cmp_conf:.4}", cmp_lead as f64 / cmp_n as f64, ds.block);
-            }
-            println!("timing: main step {:.1} ms/token, {} draft {:.2} ms/draft", t_step * 1e3 / n as f64, if gpu { "GPU" } else { "CPU reference" }, t_draft * 1e3 / n as f64);
-            let rows: Vec<String> = scored
-                .iter()
-                .map(|(a, cf)| format!("[{a},[{}]]", cf.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(",")))
-                .collect();
-            println!("dspark-json {{\"block\":{},\"step_ms\":{:.3},\"draft_ms\":{:.3},\"drafts\":[{}]}}", ds.block, t_step * 1e3 / n as f64, t_draft * 1e3 / n as f64, rows.join(","));
         }
         #[cfg(feature = "cuda")]
         Cmd::Gen { model, engram, ids, n, ctx, chunk, gpu0_gb, gpu1_gb, arena_gb, check, rank, bench_verify, check_verify, spec } => {
