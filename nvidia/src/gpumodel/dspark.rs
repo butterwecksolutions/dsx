@@ -14,6 +14,18 @@ use crate::safetensors::SafeTensors;
 use anyhow::{Context, Result};
 use std::path::Path;
 
+use crate::dspark::{dbg, nrm};
+
+/// norm of `n` floats at `ptr` from `off` (debug only)
+fn dn(g: &Gpu, ptr: u64, off: usize, n: usize) -> f32 {
+    g.download::<f32>(ptr + (off * 4) as u64, n).map(|v| nrm(&v)).unwrap_or(f32::NAN)
+}
+
+/// norm of a bf16 row (debug only)
+fn dn16(g: &Gpu, ptr: u64, n: usize) -> f32 {
+    g.download::<u16>(ptr, n).map(|v| nrm(&v.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect::<Vec<_>>())).unwrap_or(f32::NAN)
+}
+
 struct DLayer {
     attn_norm: Buf,
     ffn_norm: Buf,
@@ -153,6 +165,7 @@ impl DsparkGpu {
         let last = nl - 1;
         let markov_embed = mat(&format!("mtp.{last}.markov_head.embed.weight"))?;
         let rank = markov_embed.cols;
+        let markov_head = up(g, &mat(&format!("mtp.{last}.markov_head.head.weight"))?)?;
         let (b, nh, inter, vocab) = (block, c.n_heads, c.inter, c.vocab);
         let fz = |n: usize| g.alloc_zeroed(n * 4);
         let mut mhmix = vec![0f32; 3 * 24];
@@ -184,9 +197,9 @@ impl DsparkGpu {
             eu: fz(b * inter)?,
             eh: fz(b * inter)?,
             ey: fz(d)?,
-            logits: fz(b * vocab)?,
+            logits: fz(b * vocab.max(gm.head.rows))?,
             emb: fz(rank)?,
-            bias: fz(vocab)?,
+            bias: fz(vocab.max(markov_head.rows))?,
             best: fz(1)?,
             mh: fz(3 * d)?,
             mhmix: g.upload(&mhmix)?,
@@ -198,7 +211,7 @@ impl DsparkGpu {
             main_proj: up(g, &mat("mtp.0.main_proj.weight")?)?,
             main_norm: f32buf(g, &v("mtp.0.main_norm.weight")?)?,
             norm: f32buf(g, &v(&format!("mtp.{last}.norm.weight"))?)?,
-            markov_head: up(g, &mat(&format!("mtp.{last}.markov_head.head.weight"))?)?,
+            markov_head,
             conf: v(&format!("mtp.{last}.confidence_head.proj.weight"))?,
             markov_embed,
             b: bufs,
@@ -227,6 +240,9 @@ impl DsparkGpu {
         g.launch(gm.k["hc_pre"], (3, 1, 1), 256, 0, &[Arg::P(hid.ptr), Arg::P(b.mhmix.ptr), Arg::I(0), Arg::P(b.mh.ptr), Arg::I(d as i32)])?;
         gm.gemv(&self.main_proj, b.mh.ptr, b.mx.ptr)?;
         gm.rmsnorm(b.mx.ptr, &self.main_norm, b.mx.ptr, d, true)?;
+        if dbg() {
+            eprintln!("dspark-dbg gpu observe p{pos}: main_hidden {:.4} mx {:.4}", dn(g, b.mh.ptr, 0, 3 * d), dn(g, b.mx.ptr, 0, d));
+        }
         for l in &self.layers {
             gm.gemv(&l.kv, b.mx.ptr, b.kvo.ptr)?;
             g.launch(gm.k["kv_norm_rope_store"], (1, 1, 1), 1024, 0, &[Arg::P(b.kvo.ptr), Arg::P(l.kv_norm.ptr), Arg::I(hd as i32), Arg::F(c.eps), Arg::P(gm.freqs.0.ptr), Arg::I(c.rope_dim as i32), Arg::I(pos as i32), Arg::P(l.ring.ptr + ((pos % w) * hd * 2) as u64)])?;
@@ -240,7 +256,7 @@ impl DsparkGpu {
         let m = gm.m;
         let c = &m.cfg;
         let (d, hc, hd, nh, w, bl) = (c.dim, c.hc, c.head_dim, c.n_heads, c.window, self.block);
-        let (inter, vocab, k) = (c.inter, c.vocab, self.top_k);
+        let (inter, k) = (c.inter, self.top_k);
         let g = &gm.g;
         let b = &self.b;
         let f4 = |n: usize| n * 4;
@@ -253,16 +269,16 @@ impl DsparkGpu {
                 h[(i * hc + s) * d..(i * hc + s + 1) * d].copy_from_slice(&e);
             }
         }
-        g.htod(b.h.ptr, &h)?;
+        g.htod_sync(b.h.ptr, &h)?;
         let mut pre = vec![0f32; bl * 24];
         for i in 0..bl {
             pre[i * 24] = 1.0;
         }
-        g.htod(b.mix_f.ptr, &pre)?;
-        g.htod(b.pos.ptr, &(0..bl).map(|i| (pos + 1 + i) as i32).collect::<Vec<i32>>())?;
+        g.htod_sync(b.mix_f.ptr, &pre)?;
+        g.htod_sync(b.pos.ptr, &(0..bl).map(|i| (pos + 1 + i) as i32).collect::<Vec<i32>>())?;
         let nwin = w.min(pos + 1);
         let widx: Vec<i32> = (0..bl * w).map(|j| if j % w < nwin { (j % w) as i32 } else { -1 }).collect();
-        g.htod(b.win_idx.ptr, &widx)?;
+        g.htod_sync(b.win_idx.ptr, &widx)?;
         let gsz = nh * hd / c.o_groups;
         for l in &self.layers {
             // attention half, all block rows together
@@ -278,6 +294,10 @@ impl DsparkGpu {
                 g.launch(gm.k["kv_norm_rope_store"], (1, 1, 1), 1024, 0, &[Arg::P(b.kv.ptr + f4(i * hd) as u64), Arg::P(l.kv_norm.ptr), Arg::I(hd as i32), Arg::F(c.eps), Arg::P(gm.freqs.0.ptr), Arg::I(c.rope_dim as i32), Arg::I((pos + 1 + i) as i32), Arg::P(b.blk.ptr + (i * hd * 2) as u64)])?;
             }
             // window rows, then every block row (bidirectional), the sink in the softmax; out bf16-rounded
+            if dbg() {
+                let li = self.layers.iter().position(|x| std::ptr::eq(x, l)).unwrap();
+                eprintln!("dspark-dbg gpu L{li}: x0 {:.4} q0 {:.4} kv0 {:.4} ring0 {:.4}", dn(g, b.x.ptr, 0, d), dn(g, b.q.ptr, 0, nh * hd), dn16(g, b.blk.ptr, hd), dn16(g, l.ring.ptr, hd));
+            }
             gm.sparse_attn_small(bl, b.q.ptr, l.ring.ptr, b.win_idx.ptr, w, b.blk.ptr, b.blk_idx.ptr, bl, l.sinks.ptr, b.o.ptr)?;
             gm.rope_rows(b.o.ptr, nh, hd, false, b.pos.ptr, bl, true)?;
             gm.fake_fp8(b.o.ptr, bl * nh * hd)?;
@@ -288,12 +308,20 @@ impl DsparkGpu {
             g.launch(gm.k["round_bf16"], (((bl * rw) as u32).div_ceil(256), 1, 1), 256, 0, &[Arg::P(b.r.ptr), Arg::I((bl * rw) as i32)])?;
             gm.gemv_t(&l.o_b, b.r.ptr, b.a.ptr, bl)?;
             g.launch(gm.k["hc_post"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.a.ptr), Arg::P(b.mix_a.ptr), Arg::I(d as i32)])?;
+            if dbg() {
+                let li = self.layers.iter().position(|x| std::ptr::eq(x, l)).unwrap();
+                eprintln!("dspark-dbg gpu L{li}: attn out0 {:.4} h0 {:.4} h4 {:.4}", dn(g, b.a.ptr, 0, d), dn(g, b.h.ptr, 0, hc * d), dn(g, b.h.ptr, (bl - 1) * hc * d, hc * d));
+            }
             // ffn half: input from the attention mixes' pre, this half's mixes for its post and the next layer's pre
             g.launch(gm.k["hc_pre"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.mix_a.ptr), Arg::I(0), Arg::P(b.x.ptr), Arg::I(d as i32)])?;
             gm.hc_mixes_rows(&l.hc_ffn, b.h.ptr, b.mix_f.ptr, bl)?;
             gm.rms_rows(b.x.ptr, &l.ffn_norm, b.x.ptr, d, bl, true)?;
             self.moe(gm, l, bl, k, inter)?;
             g.launch(gm.k["hc_post"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.a.ptr), Arg::P(b.mix_f.ptr), Arg::I(d as i32)])?;
+            if dbg() {
+                let li = self.layers.iter().position(|x| std::ptr::eq(x, l)).unwrap();
+                eprintln!("dspark-dbg gpu L{li}: layer out h0 {:.4} h4 {:.4}", dn(g, b.h.ptr, 0, hc * d), dn(g, b.h.ptr, (bl - 1) * hc * d, hc * d));
+            }
         }
         // head: the main model's logits per row, then in order the Markov bias of the previous token and greedy
         g.launch(gm.k["hc_pre"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.mix_f.ptr), Arg::I(0), Arg::P(b.x.ptr), Arg::I(d as i32)])?;
@@ -301,15 +329,24 @@ impl DsparkGpu {
         gm.gemv_t(&gm.head, b.x.ptr, b.logits.ptr, bl)?;
         let xs: Vec<f32> = g.download(b.x.ptr, bl * d)?;
         let rank = self.markov_embed.cols;
+        // greedy over the tokens both tables cover (an export may pad the head)
+        let hv = gm.head.rows; // logits row stride (the head's rows; an export may pad the vocabulary)
+        let nv = hv.min(self.markov_embed.rows).min(self.markov_head.rows);
         let mut emb = vec![0f32; rank];
         let (mut out, mut conf) = (vec![next], vec![]);
         for i in 0..bl {
             self.markov_embed.dequant(out[i] as usize, &mut emb);
-            g.htod(b.emb.ptr, &emb)?;
+            g.htod_sync(b.emb.ptr, &emb)?;
             gm.gemv(&self.markov_head, b.emb.ptr, b.bias.ptr)?;
-            g.launch(gm.k["dsp_argmax_add"], (1, 1, 1), 1024, 0, &[Arg::P(b.logits.ptr + f4(i * vocab) as u64), Arg::P(b.bias.ptr), Arg::I(vocab as i32), Arg::P(b.best.ptr)])?;
-            out.push(g.download::<i32>(b.best.ptr, 1)?[0] as u32);
+            g.launch(gm.k["dsp_argmax_add"], (1, 1, 1), 1024, 0, &[Arg::P(b.logits.ptr + f4(i * hv) as u64), Arg::P(b.bias.ptr), Arg::I(nv as i32), Arg::P(b.best.ptr)])?;
+            let best = g.download::<i32>(b.best.ptr, 1)?[0];
             let x = &xs[i * d..(i + 1) * d];
+            if dbg() {
+                let lv: Vec<f32> = g.download(b.logits.ptr + f4(i * hv) as u64, hv)?;
+                eprintln!("dspark-dbg gpu head {i}: x {:.4} best {best} logit {:.4}", nrm(x), lv.get(best.max(0) as usize).copied().unwrap_or(f32::NAN));
+            }
+            anyhow::ensure!(best >= 0 && (best as usize) < nv, "draft head picked token {best} of {nv}");
+            out.push(best as u32);
             conf.push(x.iter().chain(&emb).zip(&self.conf).map(|(a, b)| a * b).sum());
         }
         Ok((out[1..].to_vec(), conf))
