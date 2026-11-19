@@ -11,6 +11,11 @@ the log then says `tier: off` and has no `tier: placement from` line, and the sa
 toward the devices with room while the server runs, and keeps all of it next to the model for the next start. It needs
 no option and adapts to whatever GPUs, RAM and disks a start finds.
 
+In effect it replaces a separate calibration run ([route-hotness calibration](route-hotness-calibration.md):
+`DSX_LOG_ROUTES` on a calibration server, then `quant/rank_from_routes.py`): the placement follows the traffic the
+server actually serves and adapts when the workload changes, without a calibration server or a hand-made `--rank` file
+per workload. It has not been compared head-to-head with a workload-calibrated `--rank` file.
+
 ## What it does
 
 | When | What |
