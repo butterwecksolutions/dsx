@@ -145,6 +145,9 @@ pub struct GpuModel<'m> {
     comp_src: usize,
     idxk_src: usize,
     topk_rows: Vec<i32>,
+    /// DSpark: layers whose input residual `step` copies aside (`capture_hidden`), and where to
+    hid_layers: Vec<usize>,
+    hid_buf: Option<Buf>,
     candidates: Vec<bool>,
     engram_hist: Vec<i64>,
     /// routed experts on the CPU pool (GSQ block types); None = reference matvec (FP4 checkpoint)
@@ -549,6 +552,8 @@ impl<'m> GpuModel<'m> {
             comp_src: usize::MAX,
             idxk_src: usize::MAX,
             topk_rows: vec![],
+            hid_layers: vec![],
+            hid_buf: None,
             candidates: vec![],
             engram_hist: vec![],
             cpu_moe: if matches!(m.src, crate::model::Source::Gguf(_)) {
@@ -2091,6 +2096,25 @@ impl<'m> GpuModel<'m> {
         Ok(())
     }
 
+    /// DSpark: from now on every `step` copies the residual entering each of `layers` aside; `main_hidden` reads it.
+    pub fn capture_hidden(&mut self, layers: &[usize]) -> Result<()> {
+        let c = &self.m.cfg;
+        self.hid_buf = if layers.is_empty() { None } else { Some(self.g.alloc(layers.len() * c.hc * c.dim * 4)?) };
+        self.hid_layers = layers.to_vec();
+        Ok(())
+    }
+
+    /// The last step's captured residuals as DSpark's `main_hidden`: per layer the mean over the hc streams, BF16-rounded.
+    pub fn main_hidden(&self) -> Result<Vec<f32>> {
+        let (c, b) = (&self.m.cfg, self.hid_buf.as_ref().context("capture_hidden not called")?);
+        let (d, hc) = (c.dim, c.hc);
+        let raw: Vec<f32> = self.g.download(b.ptr, self.hid_layers.len() * hc * d)?;
+        Ok(raw
+            .chunks(hc * d)
+            .flat_map(|h| (0..d).map(move |i| crate::numerics::round_bf16((0..hc).map(|k| h[k * d + i]).sum::<f32>() / hc as f32)))
+            .collect())
+    }
+
     pub fn step(&mut self, token: u32) -> Result<Vec<f32>> {
         let t_step = std::time::Instant::now();
         // DSX_ADAPT_EARLY=1: scan and start replacements before the sync (off: window 30 measured the same swap count but
@@ -2240,6 +2264,11 @@ impl<'m> GpuModel<'m> {
                 }
                 self.engram(li, eidx)?;
                 self.mark(&mut tm, "engram")?;
+            }
+            if let (Some(k), Some(b)) = (self.hid_layers.iter().position(|&x| x == li), self.hid_buf.as_ref()) {
+                // DSpark reads the residual entering this layer's attention (after Engram), as the CPU reference
+                let row = c.hc * d * 4;
+                self.g.dtod(b.ptr + (k * row) as u64, self.h.ptr, row)?;
             }
             self.ev(li, 8)?;
             // attention half: mixes for this sublayer; input collapsed with the previous FFN's pre

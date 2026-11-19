@@ -40,6 +40,34 @@ enum Cmd {
         #[arg(short, default_value_t = 32)]
         n: usize,
     },
+    /// DSpark acceptance on the GPU engine (a GGUF plus the checkpoint's mtp.* shards): greedy decode on the GPUs, a
+    /// draft from the CPU reference after every token, scored against the tokens the model actually produces next.
+    /// Prints one `dspark-json` line (per draft: accepted count and confidences) for offline cost models.
+    #[cfg(feature = "cuda")]
+    SpecDraft {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        engram: Option<PathBuf>,
+        /// directory with config.json, model.safetensors.index.json and the shards holding mtp.*
+        #[arg(long)]
+        mtp: PathBuf,
+        /// prompt token ids, comma separated, or @file
+        #[arg(long)]
+        ids: String,
+        #[arg(short, default_value_t = 128)]
+        n: usize,
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+        #[arg(long = "main-gb", value_name = "GB", default_value_t = -1.5, allow_negative_numbers = true)]
+        gpu0_gb: f64,
+        #[arg(long = "aux-gb", value_name = "GB", default_value_t = -1.0, allow_negative_numbers = true)]
+        gpu1_gb: f64,
+        #[arg(long, default_value_t = 0.0)]
+        arena_gb: f64,
+        #[arg(long)]
+        rank: Option<PathBuf>,
+    },
     /// Prefill a prompt in chunks, then decode greedily; --check also runs the prompt token by token and compares.
     #[cfg(feature = "cuda")]
     Gen {
@@ -318,6 +346,66 @@ fn main() -> Result<()> {
                 println!("window {w}: {:.1} distinct experts per layer (of {} picks)", tot / cnt, w * m.cfg.top_k);
             }
             println!("generated ids: {seq:?}");
+        }
+        #[cfg(feature = "cuda")]
+        Cmd::SpecDraft { model, engram, mtp, ids, n, ctx, gpu0_gb, gpu1_gb, arena_gb, rank } => {
+            let ids: Vec<u32> = match ids.strip_prefix('@') {
+                Some(f) => std::fs::read_to_string(f)?,
+                None => ids,
+            }
+            .split(|ch: char| ch == ',' || ch.is_whitespace())
+            .filter(|x| !x.is_empty())
+            .map(|x| x.parse())
+            .collect::<std::result::Result<_, _>>()?;
+            let t0 = Instant::now();
+            let m = load(&model, engram.as_deref())?;
+            let st = dsx::safetensors::SafeTensors::open_prefix(&mtp, "mtp.")?;
+            let ds = dsx::dspark::Dspark::load(&m, &st, &mtp)?;
+            let mut gm = dsx::gpumodel::GpuModel::with_placement(&m, -1, ctx, dsx::gpumodel::Placement { gpu0_gb, aux_gb: gpu1_gb, arena_gb, prefill_chunk: 0, rank })?;
+            gm.capture_hidden(&ds.targets)?;
+            eprintln!("loaded in {:.1} s; draft block {}, targets {:?}", t0.elapsed().as_secs_f32(), ds.block, ds.targets);
+            let mut dst = ds.new_state(&m);
+            let mut logits = vec![];
+            for &tok in &ids {
+                logits = gm.step(tok)?;
+                ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+            }
+            let (mut drafts, mut seq): (Vec<(usize, Vec<u32>, Vec<f32>)>, Vec<u32>) = (vec![], vec![]);
+            let (mut t_draft, mut t_step) = (0f64, 0f64);
+            for _ in 0..n {
+                let next = top(&logits, 1)[0].0;
+                let t = Instant::now();
+                let (d, cf) = ds.draft(&m, &dst, gm.pos - 1, next);
+                t_draft += t.elapsed().as_secs_f64();
+                drafts.push((seq.len() + 1, d, cf));
+                seq.push(next);
+                let t = Instant::now();
+                logits = gm.step(next)?;
+                t_step += t.elapsed().as_secs_f64();
+                ds.observe(&m, &mut dst, &gm.main_hidden()?, gm.pos - 1);
+            }
+            // per draft: how many leading drafts match what the model produced (only drafts that end inside the run)
+            let scored: Vec<(usize, &Vec<f32>)> = drafts
+                .iter()
+                .filter(|(start, d, _)| start + d.len() <= seq.len())
+                .map(|(start, d, cf)| (d.iter().zip(&seq[*start..]).take_while(|(a, b)| a == b).count(), cf))
+                .collect();
+            let mut hist = vec![0usize; ds.block + 1];
+            for (a, _) in &scored {
+                hist[*a] += 1;
+            }
+            let tot = scored.len().max(1) as f64;
+            let mean = scored.iter().map(|(a, _)| *a).sum::<usize>() as f64 / tot;
+            // hit rate at draft position i given all before it hit
+            let reach = |i: usize| scored.iter().filter(|(a, _)| *a >= i).count() as f64;
+            let cond: Vec<f64> = (1..=ds.block).map(|i| (reach(i) / reach(i - 1).max(1.0) * 1000.0).round() / 1000.0).collect();
+            println!("dspark: {} drafts scored, accepted histogram {hist:?}, mean {mean:.2} of {}; hit rate per position given the previous hit {cond:?}", scored.len(), ds.block);
+            println!("timing: main step {:.1} ms/token, CPU draft {:.1} ms/draft (reference code, not tuned)", t_step * 1e3 / n as f64, t_draft * 1e3 / n as f64);
+            let rows: Vec<String> = scored
+                .iter()
+                .map(|(a, cf)| format!("[{a},[{}]]", cf.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(",")))
+                .collect();
+            println!("dspark-json {{\"block\":{},\"step_ms\":{:.3},\"draft_ms\":{:.3},\"drafts\":[{}]}}", ds.block, t_step * 1e3 / n as f64, t_draft * 1e3 / n as f64, rows.join(","));
         }
         #[cfg(feature = "cuda")]
         Cmd::Gen { model, engram, ids, n, ctx, chunk, gpu0_gb, gpu1_gb, arena_gb, check, rank, bench_verify, check_verify, spec } => {
