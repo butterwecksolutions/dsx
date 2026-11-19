@@ -41,8 +41,12 @@ struct DLayer {
     hc_ffn: (DMat, Buf, Buf),
     gate_w: DMat,
     gate_bias: Buf,
-    /// [expert] (gate w1, up w3, down w2), FP4
+    /// [expert] (gate w1, up w3, down w2), FP4: owns the buffers `wtab` / `stab` point into
+    #[allow(dead_code)]
     experts: Vec<[DMat; 3]>,
+    /// per matrix (gate, up, down): device tables of every expert's weight and scale pointers, for gemv_fp4_sel
+    wtab: [Buf; 3],
+    stab: [Buf; 3],
     sh: [DMat; 3],
     /// bf16 [window][head_dim]: the main model's projected residual, post-RoPE, FP8 fake-quantized
     ring: Buf,
@@ -68,14 +72,17 @@ struct Bufs {
     rl: Buf,      // [b][ne] router logits
     sel: Buf,     // [b][k] i32
     wts: Buf,     // [b][k] f32
-    eg: Buf,      // [b][inter] (gate; shared: all rows)
-    eu: Buf,      // [b][inter]
-    eh: Buf,      // [b][inter]
-    ey: Buf,      // [d]
+    eg: Buf,      // [b*k][inter] routed gate (shared: [b][inter])
+    eu: Buf,      // [b*k][inter]
+    eh: Buf,      // [b*k][inter]
+    ey: Buf,      // [b*k][d]
+    xq: Buf,      // [b][d] FP8-fake-quantized expert input
+    ehq: Buf,     // [b*k][inter]
+    toks: Buf,    // [b+1] i32: next, then the drafted tokens
+    embs: Buf,    // [b][rank] Markov embeddings used
+    mtab: Buf,    // bf16 [vocab][rank] Markov embedding table
     logits: Buf,  // [b][vocab]
-    emb: Buf,     // [rank]
     bias: Buf,    // [vocab]
-    best: Buf,    // i32
     mh: Buf,      // [3][d]
     mhmix: Buf,   // [3][24]: 1/hc each
     mx: Buf,      // [d]
@@ -140,6 +147,12 @@ impl DsparkGpu {
             let mut o_a = mat(&p("attn.wo_a.weight"))?;
             o_a.act_fp8 = false; // the reference fake-quantizes o per group itself
             let ex = |e: usize, wn: &str| -> Result<DMat> { up(g, &mat(&p(&format!("ffn.experts.{e}.{wn}.weight")))?) };
+            let experts = (0..ne).map(|e| Ok([ex(e, "w1")?, ex(e, "w3")?, ex(e, "w2")?])).collect::<Result<Vec<[DMat; 3]>>>()?;
+            anyhow::ensure!(experts.iter().all(|x| x.iter().all(|m| m.ty == GType::Fp4)), "draft experts are not checkpoint FP4");
+            let tab = |j: usize, s: bool| -> Result<Buf> {
+                g.upload(&experts.iter().map(|x| if s { x[j].scale.as_ref().unwrap().ptr } else { x[j].buf.ptr }).collect::<Vec<u64>>())
+            };
+            let (wtab, stab) = ([tab(0, false)?, tab(1, false)?, tab(2, false)?], [tab(0, true)?, tab(1, true)?, tab(2, true)?]);
             layers.push(DLayer {
                 attn_norm: f32buf(g, &v(&p("attn_norm.weight"))?)?,
                 ffn_norm: f32buf(g, &v(&p("ffn_norm.weight"))?)?,
@@ -155,7 +168,9 @@ impl DsparkGpu {
                 hc_ffn: (f32mat(g, &v(&p("hc_ffn_fn"))?, 24)?, f32buf(g, &v(&p("hc_ffn_scale"))?)?, f32buf(g, &v(&p("hc_ffn_base"))?)?),
                 gate_w: bf16mat(g, &v(&p("ffn.gate.weight"))?, ne)?,
                 gate_bias: f32buf(g, &v(&p("ffn.gate.bias"))?)?,
-                experts: (0..ne).map(|e| Ok([ex(e, "w1")?, ex(e, "w3")?, ex(e, "w2")?])).collect::<Result<Vec<_>>>()?,
+                experts,
+                wtab,
+                stab,
                 sh: [
                     up(g, &mat(&p("ffn.shared_experts.w1.weight"))?)?,
                     up(g, &mat(&p("ffn.shared_experts.w3.weight"))?)?,
@@ -195,14 +210,27 @@ impl DsparkGpu {
             rl: fz(b * ne)?,
             sel: fz(b * top_k)?,
             wts: fz(b * top_k)?,
-            eg: fz(b * inter)?,
-            eu: fz(b * inter)?,
-            eh: fz(b * inter)?,
-            ey: fz(d)?,
+            eg: fz(b * top_k * inter)?,
+            eu: fz(b * top_k * inter)?,
+            eh: fz(b * top_k * inter)?,
+            ey: fz(b * top_k * d)?,
+            xq: fz(b * d)?,
+            ehq: fz(b * top_k * inter)?,
+            toks: fz(b + 1)?,
+            embs: fz(b * rank)?,
+            mtab: {
+                let mut h = vec![half::bf16::ZERO; markov_embed.rows * rank];
+                let mut row = vec![0f32; rank];
+                for r in 0..markov_embed.rows {
+                    markov_embed.dequant(r, &mut row);
+                    for (o, &v) in h[r * rank..(r + 1) * rank].iter_mut().zip(&row) {
+                        *o = half::bf16::from_f32(v);
+                    }
+                }
+                g.upload(&h)?
+            },
             logits: fz(b * vocab.max(gm.head.rows))?,
-            emb: fz(rank)?,
             bias: fz(vocab.max(markov_head.rows))?,
-            best: fz(1)?,
             mh: fz(3 * d)?,
             mhmix: g.upload(&mhmix)?,
             mx: fz(d)?,
@@ -330,28 +358,30 @@ impl DsparkGpu {
         g.launch(gm.k["hc_pre"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.mix_f.ptr), Arg::I(0), Arg::P(b.x.ptr), Arg::I(d as i32)])?;
         gm.rms_rows(b.x.ptr, &self.norm, b.x.ptr, d, bl, false)?;
         gm.gemv_t(&gm.head, b.x.ptr, b.logits.ptr, bl)?;
-        let xs: Vec<f32> = g.download(b.x.ptr, bl * d)?;
+        // in order on the device: Markov embedding of the previous token, its bias over the vocabulary, greedy
         let rank = self.markov_embed.cols;
-        // greedy over the tokens both tables cover (an export may pad the head)
         let hv = gm.head.rows; // logits row stride (the head's rows; an export may pad the vocabulary)
         let nv = hv.min(self.markov_embed.rows).min(self.markov_head.rows);
-        let mut emb = vec![0f32; rank];
-        let (mut out, mut conf) = (vec![next], vec![]);
+        g.htod_sync(b.toks.ptr, &[next as i32])?;
         for i in 0..bl {
-            self.markov_embed.dequant(out[i] as usize, &mut emb);
-            g.htod_sync(b.emb.ptr, &emb)?;
-            gm.gemv(&self.markov_head, b.emb.ptr, b.bias.ptr)?;
-            g.launch(gm.k["dsp_argmax_add"], (1, 1, 1), 1024, 0, &[Arg::P(b.logits.ptr + f4(i * hv) as u64), Arg::P(b.bias.ptr), Arg::I(nv as i32), Arg::P(b.best.ptr)])?;
-            let best = g.download::<i32>(b.best.ptr, 1)?[0];
-            let x = &xs[i * d..(i + 1) * d];
-            if dbg() {
-                let lv: Vec<f32> = g.download(b.logits.ptr + f4(i * hv) as u64, hv)?;
-                eprintln!("dspark-dbg gpu head {i}: x {:.4} best {best} logit {:.4}", nrm(x), lv.get(best.max(0) as usize).copied().unwrap_or(f32::NAN));
-            }
-            anyhow::ensure!(best >= 0 && (best as usize) < nv, "draft head picked token {best} of {nv}");
-            out.push(best as u32);
-            conf.push(x.iter().chain(&emb).zip(&self.conf).map(|(a, b)| a * b).sum());
+            let emb = b.embs.ptr + f4(i * rank) as u64;
+            g.launch(gm.k["dsp_gather_bf16"], (1, 1, 1), 256, 0, &[Arg::P(b.mtab.ptr), Arg::P(b.toks.ptr + f4(i) as u64), Arg::I(rank as i32), Arg::P(emb)])?;
+            gm.gemv(&self.markov_head, emb, b.bias.ptr)?;
+            g.launch(gm.k["dsp_argmax_add"], (1, 1, 1), 1024, 0, &[Arg::P(b.logits.ptr + f4(i * hv) as u64), Arg::P(b.bias.ptr), Arg::I(nv as i32), Arg::P(b.toks.ptr + f4(i + 1) as u64)])?;
         }
+        let toks: Vec<i32> = g.download(b.toks.ptr, bl + 1)?;
+        let xs: Vec<f32> = g.download(b.x.ptr, bl * d)?;
+        let embs: Vec<f32> = g.download(b.embs.ptr, bl * rank)?;
+        let mut conf = vec![];
+        for i in 0..bl {
+            anyhow::ensure!(toks[i + 1] >= 0 && (toks[i + 1] as usize) < nv, "draft head picked token {} of {nv}", toks[i + 1]);
+            let (x, emb) = (&xs[i * d..(i + 1) * d], &embs[i * rank..(i + 1) * rank]);
+            conf.push(x.iter().chain(emb).zip(&self.conf).map(|(a, b)| a * b).sum());
+            if dbg() {
+                eprintln!("dspark-dbg gpu head {i}: x {:.4} best {}", nrm(x), toks[i + 1]);
+            }
+        }
+        let out: Vec<u32> = toks.iter().map(|&x| x as u32).collect();
         Ok((out[1..].to_vec(), conf))
     }
 
@@ -360,7 +390,6 @@ impl DsparkGpu {
         let c = &gm.m.cfg;
         let d = c.dim;
         let (g, b) = (&gm.g, &self.b);
-        let f4 = |n: usize| (n * 4) as u64;
         gm.gemv_t(&l.gate_w, b.x.ptr, b.rl.ptr, bl)?;
         g.launch(gm.k["router_topk"], (bl as u32, 1, 1), 32, 0, &[Arg::P(b.rl.ptr), Arg::P(l.gate_bias.ptr), Arg::P(b.sel.ptr), Arg::P(b.wts.ptr), Arg::I(self.ne as i32), Arg::I(k as i32), Arg::F(c.route_scale), Arg::P(0)])?;
         // shared expert for every row (into sh_out) while the picks come back
@@ -368,22 +397,18 @@ impl DsparkGpu {
         gm.gemv_t(&l.sh[1], b.x.ptr, b.eu.ptr, bl)?;
         g.launch(gm.k["swiglu"], ((inter as u32).div_ceil(256), bl as u32, 1), 256, 0, &[Arg::P(b.eg.ptr), Arg::P(b.eu.ptr), Arg::I(inter as i32), Arg::P(0), Arg::P(b.eh.ptr), Arg::I(inter as i32), Arg::F(c.swiglu_limit)])?;
         gm.gemv_t(&l.sh[2], b.eh.ptr, b.sh_out.ptr, bl)?;
-        let sel: Vec<i32> = g.download(b.sel.ptr, bl * k)?;
-        g.memset(b.a.ptr, bl * d * 4)?;
-        for t in 0..bl {
-            let xt = b.x.ptr + f4(t * d);
-            for j in 0..k {
-                let e = sel[t * k + j];
-                anyhow::ensure!(e >= 0 && (e as usize) < self.ne, "draft router picked expert {e}");
-                let ex = &l.experts[e as usize];
-                gm.gemv_t(&ex[0], xt, b.eg.ptr, 1)?;
-                gm.gemv_t(&ex[1], xt, b.eu.ptr, 1)?;
-                g.launch(gm.k["swiglu"], ((inter as u32).div_ceil(256), 1, 1), 256, 0, &[Arg::P(b.eg.ptr), Arg::P(b.eu.ptr), Arg::I(inter as i32), Arg::P(b.wts.ptr + f4(t * k + j)), Arg::P(b.eh.ptr), Arg::I(inter as i32), Arg::F(c.swiglu_limit)])?;
-                gm.gemv_t(&ex[2], b.eh.ptr, b.ey.ptr, 1)?;
-                g.launch(gm.k["add_inplace"], ((d as u32).div_ceil(256), 1, 1), 256, 0, &[Arg::P(b.a.ptr + f4(t * d)), Arg::P(b.ey.ptr), Arg::I(d as i32)])?;
-            }
-        }
-        g.launch(gm.k["add_inplace"], (((bl * d) as u32).div_ceil(256), 1, 1), 256, 0, &[Arg::P(b.a.ptr), Arg::P(b.sh_out.ptr), Arg::I((bl * d) as i32)])?;
-        g.launch(gm.k["round_bf16"], (((bl * d) as u32).div_ceil(256), 1, 1), 256, 0, &[Arg::P(b.a.ptr), Arg::I((bl * d) as i32)])
+        // routed picks on the device: rows y = (token, pick); gate and up, SwiGLU with the pick's weight, down, sum
+        let n = bl * k;
+        let fq = |x: u64, out: u64, cnt: usize| g.launch(gm.k["fake_fp8_copy"], (((cnt / 32) as u32).div_ceil(8), 1, 1), 256, 0, &[Arg::P(x), Arg::P(out), Arg::I(cnt as i32)]);
+        fq(b.x.ptr, b.xq.ptr, bl * d)?;
+        let sel = |j: usize, rows: usize, kk: usize, x: u64, xdiv: usize, y: u64| {
+            g.launch(gm.k["gemv_fp4_sel"], ((rows as u32).div_ceil(16), n as u32, 1), 128, 0, &[Arg::P(l.wtab[j].ptr), Arg::P(l.stab[j].ptr), Arg::P(b.sel.ptr), Arg::I(rows as i32), Arg::I(kk as i32), Arg::P(x), Arg::I(xdiv as i32), Arg::P(y)])
+        };
+        sel(0, inter, d, b.xq.ptr, k, b.eg.ptr)?;
+        sel(1, inter, d, b.xq.ptr, k, b.eu.ptr)?;
+        g.launch(gm.k["swiglu"], ((inter as u32).div_ceil(256), n as u32, 1), 256, 0, &[Arg::P(b.eg.ptr), Arg::P(b.eu.ptr), Arg::I(inter as i32), Arg::P(b.wts.ptr), Arg::P(b.eh.ptr), Arg::I(inter as i32), Arg::F(c.swiglu_limit)])?;
+        fq(b.eh.ptr, b.ehq.ptr, n * inter)?;
+        sel(2, d, inter, b.ehq.ptr, 1, b.ey.ptr)?;
+        g.launch(gm.k["dsp_moe_sum"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.a.ptr), Arg::P(b.ey.ptr), Arg::P(b.sh_out.ptr), Arg::I(d as i32), Arg::I(k as i32)])
     }
 }
