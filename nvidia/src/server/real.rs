@@ -354,6 +354,7 @@ impl Real {
                 raw = self.gm.step(tok)?;
                 if let Some((dg, ctl)) = self.spec.as_mut() {
                     ctl.note_step(ts.elapsed().as_secs_f64() * 1e3);
+                    ctl.note_conf(crate::spec::top_prob(&raw));
                     dg.observe(&self.gm, self.gm.pos - 1)?;
                 }
                 if profile { profile_steps += 1; }
@@ -391,6 +392,9 @@ impl Real {
             if let Some((dg, ctl)) = self.spec.as_mut() {
                 for r in 0..=j {
                     dg.observe_row(&self.gm, p0 + r, r)?;
+                }
+                for v in &lv[..=j] {
+                    ctl.note_conf(crate::spec::top_prob(v));
                 }
                 ctl.note_pass(l, j, dms, tv.elapsed().as_secs_f64() * 1e3);
             }

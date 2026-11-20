@@ -1625,6 +1625,9 @@ impl<'m> GpuModel<'m> {
         // few rows: one block per row with the warps splitting k (measured faster below ~2K rows)
         let sk = n < 2048 && matches!(kname, "gemv_q8r" | "gemv_f16" | "gemv_bf16" | "gemv_f32");
         let kname = if sk { match kname { "gemv_q8r" => "gemv_q8r_sk", "gemv_f16" => "gemv_f16_sk", "gemv_bf16" => "gemv_bf16_sk", _ => "gemv_f32_sk" } } else { kname };
+        // several tokens (verify passes, DSpark drafts): 4 rows per warp share each x load; at 1 row per warp the x reads
+        // are T times the weight bytes (the 129K-row head: 3.4 ms for 5 rows). DSX_Q8R4=0: off
+        let kname = if kname == "gemv_q8r" && t > 1 && n % 16 == 0 && !std::env::var("DSX_Q8R4").is_ok_and(|v| v == "0") { "gemv_q8r4" } else { kname };
         // one token: gemv_q8r without the MAXT accumulators (bit-identical, more warps per SM)
         let kname = if kname == "gemv_q8r" && t == 1 && self.q8r1 { "gemv_q8r1" } else { kname };
         // one token, few rows: the split-k kernels without MAXT accumulators (bit-identical)

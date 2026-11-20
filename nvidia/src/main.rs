@@ -533,6 +533,7 @@ fn main() -> Result<()> {
                     let r = dg.prof_report();
                     if !r.is_empty() {
                         println!("[{pname}] draft sections ms: {r}");
+                        println!("[{pname}] draft expert picks: {}", dg.usage_report());
                     }
                 }
                 let rows: Vec<String> = scored
@@ -569,6 +570,7 @@ fn main() -> Result<()> {
                                 let ts = Instant::now();
                                 let lg = gm.step(next)?;
                                 ctl.note_step(ts.elapsed().as_secs_f64() * 1e3);
+                                ctl.note_conf(dsx::spec::top_prob(&lg));
                                 dg.observe(&gm, gm.pos - 1)?;
                                 next = top(&lg, 1)[0].0;
                                 steps += 1;
@@ -588,6 +590,9 @@ fn main() -> Result<()> {
                                 dg.observe_row(&gm, p0 + r, r)?;
                             }
                             gm.after_pass(1 + j)?;
+                            for v in &lv[..=j] {
+                                ctl.note_conf(dsx::spec::top_prob(v));
+                            }
                             ctl.note_pass(l, j, dms, tv.elapsed().as_secs_f64() * 1e3);
                             out.push(next);
                             out.extend_from_slice(&d[..j]);
@@ -602,7 +607,7 @@ fn main() -> Result<()> {
                         let tps = n as f64 / el;
                         println!("[{pname}] spec {vname}: {:.2} tok/s vs plain {:.2} = {:.2}x; {passes} verify passes ({acc}/{verified} drafts accepted), {steps} plain steps; same as plain for the first {same}/{n} tokens", tps, 1e3 / step_ms, tps * step_ms / 1e3);
                         if auto {
-                            println!("[{pname}]   control: step {:.1} ms, draft {:.1} ms, verify ms by T {:?}, hit {:?}", ctl.step_ms, ctl.draft_ms, ctl.verify_ms.iter().skip(1).map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>(), ctl.hit.iter().map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>());
+                            println!("[{pname}]   control: probe gap {}, conf {:.2} (paid at {:.2}), step {:.1} ms, draft {:.1} ms, verify ms by T {:?}, hit {:?}", ctl.probe_gap, ctl.conf, ctl.conf_paid, ctl.step_ms, ctl.draft_ms, ctl.verify_ms.iter().skip(1).map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>(), ctl.hit.iter().map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>());
                         }
                         runs.push(format!("{{\"name\":\"{vname}\",\"tps\":{tps:.3},\"x\":{:.4},\"passes\":{passes},\"accepted\":{acc},\"verified\":{verified},\"steps\":{steps},\"same\":{same}}}", tps * step_ms / 1e3));
                     }

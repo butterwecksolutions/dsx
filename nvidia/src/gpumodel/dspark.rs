@@ -135,6 +135,8 @@ pub struct DsparkGpu {
     prof_on: bool,
     prof: Vec<(&'static str, f64)>,
     prof_n: usize,
+    /// DSX_DSPARK_PROF: draft expert picks per layer
+    usage: Vec<Vec<u64>>,
 }
 
 fn up(g: &Gpu, w: &Mat) -> Result<DMat> {
@@ -296,6 +298,7 @@ impl DsparkGpu {
             prof_on: std::env::var_os("DSX_DSPARK_PROF").is_some(),
             prof: vec![],
             prof_n: 0,
+            usage: vec![],
         };
         anyhow::ensure!(ds.targets.len() == 3, "DSpark reads 3 target layers, config has {:?}", ds.targets);
         eprintln!("dspark: main head {:?} {}x{} (q8r {}, q6 {})", gm.head.ty, gm.head.rows, gm.head.cols, gm.head.q8r, gm.head.q6.is_some());
@@ -396,6 +399,22 @@ impl DsparkGpu {
         self.prof_on = on;
     }
 
+    /// DSX_DSPARK_PROF=1: share of the draft experts' picks the hottest 8 / 16 / 32 / 64 experts per layer took
+    pub fn usage_report(&self) -> String {
+        self.usage
+            .iter()
+            .enumerate()
+            .map(|(li, u)| {
+                let mut v = u.clone();
+                v.sort_unstable_by(|a, b| b.cmp(a));
+                let tot = v.iter().sum::<u64>().max(1) as f64;
+                let top = |n: usize| 100.0 * v.iter().take(n).sum::<u64>() as f64 / tot;
+                format!("L{li}: top8 {:.0}% top16 {:.0}% top32 {:.0}% top64 {:.0}%", top(8), top(16), top(32), top(64))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     /// DSX_DSPARK_PROF=1: milliseconds per draft section (each section synchronized), averaged
     pub fn prof_report(&self) -> String {
         let n = self.prof_n.max(1) as f64;
@@ -444,7 +463,8 @@ impl DsparkGpu {
         g.htod_sync(b.win_idx.ptr, &widx)?;
         let gsz = nh * hd / c.o_groups;
         pf.mark(g, "setup");
-        for l in &self.layers {
+        let mut picks: Vec<(usize, Vec<i32>)> = vec![];
+        for (li, l) in self.layers.iter().enumerate() {
             // attention half, all block rows together
             gm.hc_mixes_rows(&l.hc_attn, b.h.ptr, b.mix_a.ptr, bl)?;
             g.launch(gm.k["hc_pre"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.mix_f.ptr), Arg::I(0), Arg::P(b.x.ptr), Arg::I(d as i32)])?;
@@ -484,6 +504,9 @@ impl DsparkGpu {
             pf.mark(g, "ffn mixes");
             self.moe(gm, l, bl, k, inter)?;
             pf.mark(g, "moe");
+            if pf.on {
+                picks.push((li, g.download(b.sel.ptr, bl * k)?));
+            }
             g.launch(gm.k["hc_post"], (bl as u32, 1, 1), 256, 0, &[Arg::P(b.h.ptr), Arg::P(b.a.ptr), Arg::P(b.mix_f.ptr), Arg::I(d as i32)])?;
             if dbg() {
                 let li = self.layers.iter().position(|x| std::ptr::eq(x, l)).unwrap();
@@ -522,6 +545,16 @@ impl DsparkGpu {
         let out: Vec<u32> = toks.iter().map(|&x| x as u32).collect();
         pf.mark(g, "download+conf");
         if pf.on {
+            if self.usage.is_empty() {
+                self.usage = vec![vec![0u64; self.ne]; self.layers.len()];
+            }
+            for (li, s) in picks {
+                for e in s {
+                    if e >= 0 && (e as usize) < self.ne {
+                        self.usage[li][e as usize] += 1;
+                    }
+                }
+            }
             self.prof_n += 1;
             for (k, v) in pf.v {
                 match self.prof.iter_mut().find(|(n, _)| *n == k) {
