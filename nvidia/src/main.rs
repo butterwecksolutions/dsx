@@ -507,6 +507,7 @@ fn main() -> Result<()> {
                     }
                     if let Some(dg) = dg.as_mut() {
                         dg.observe(&gm, gm.pos - 1)?;
+                        dg.maintain(&gm)?;
                     }
                 }
                 // per draft: how many leading drafts match what the model produced (only drafts that end inside the run)
@@ -591,6 +592,7 @@ fn main() -> Result<()> {
                                 dg.observe_row(&gm, p0 + r, r)?;
                             }
                             gm.after_pass(1 + j)?;
+                            dg.maintain(&gm)?;
                             for v in &lv[..=j] {
                                 ctl.note_conf(dsx::spec::top_prob(v));
                             }
@@ -614,6 +616,9 @@ fn main() -> Result<()> {
                     }
                 }
                 println!("dspark-json {{\"name\":\"{pname}\",\"block\":{},\"step_ms\":{step_ms:.3},\"draft_ms\":{draft_ms:.3},\"spec\":[{}],\"drafts\":[{}]}}", ds.block, runs.join(","), rows.join(","));
+            }
+            if let Some(dg) = dg.as_ref() {
+                dg.save_heat();
             }
         }
         #[cfg(feature = "cuda")]

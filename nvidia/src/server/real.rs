@@ -399,6 +399,9 @@ impl Real {
                 ctl.note_pass(l, j, dms, tv.elapsed().as_secs_f64() * 1e3);
             }
             self.gm.after_pass(1 + j)?;
+            if let Some((dg, _)) = self.spec.as_mut() {
+                dg.maintain(&self.gm)?;
+            }
             if profile { profile_steps += 1 + j; }
             self.cached.push(tok);
             raw = lv[j].clone();

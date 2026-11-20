@@ -152,6 +152,9 @@ pub struct DsparkGpu {
     heat: Vec<Vec<f64>>,
     since_swap: usize,
     pub swaps: usize,
+    drafts: usize,
+    updates: usize,
+    heat_file: Option<std::path::PathBuf>,
     _zero: [DMat; 3],
 }
 
@@ -202,6 +205,11 @@ impl DsparkGpu {
         // resident draft experts per layer (DSX_DSPARK_SLOTS, default 32 of 128: they took 94-100 % of the picks)
         let nslots = std::env::var("DSX_DSPARK_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(32).clamp(1, ne);
         let mut zero: Option<[DMat; 3]> = None;
+        // the heat a previous run saved: its hottest experts start resident (else the router bias decides)
+        let saved_heat: Option<Vec<Vec<f64>>> = Self::heat_path(dir)
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<Vec<Vec<f64>>>(&b).ok())
+            .filter(|h| h.len() == nl && h.iter().all(|r| r.len() == ne));
         let mut layers = vec![];
         for l in 0..nl {
             let p = |s: &str| format!("mtp.{l}.{s}");
@@ -221,7 +229,10 @@ impl DsparkGpu {
             // first residents: the router's bias favours them (no use measured yet)
             let bias = v(&p("ffn.gate.bias"))?;
             let mut order: Vec<usize> = (0..ne).collect();
-            order.sort_by(|&a, &b| bias[b].total_cmp(&bias[a]));
+            match &saved_heat {
+                Some(h) => order.sort_by(|&a, &b| h[l][b].total_cmp(&h[l][a])),
+                None => order.sort_by(|&a, &b| bias[b].total_cmp(&bias[a])),
+            }
             let mut slots = vec![];
             let mut slot_of = vec![None; ne];
             let mut who = vec![];
@@ -272,6 +283,20 @@ impl DsparkGpu {
                     up(g, &mat(&p("ffn.shared_experts.w2.weight"))?)?,
                 ],
                 ring: g.alloc_zeroed(w * hd * 2)?,
+            });
+        }
+        // bring every draft expert's bytes into the page cache in the background, so swapping one in never waits for
+        // the disk
+        {
+            let spans: Vec<(usize, usize)> = layers.iter().flat_map(|l: &DLayer| l.host.iter().flat_map(|x| x.iter().flat_map(|m| [(m.bytes().as_ptr() as usize, m.bytes().len()), (m.scale_bytes().as_ptr() as usize, m.scale_bytes().len())]))).collect();
+            std::thread::spawn(move || {
+                let mut s = 0u8;
+                for (p, n) in spans {
+                    for o in (0..n).step_by(4096) {
+                        s = s.wrapping_add(unsafe { std::ptr::read_volatile((p + o) as *const u8) });
+                    }
+                }
+                std::hint::black_box(s);
             });
         }
         let last = nl - 1;
@@ -355,9 +380,12 @@ impl DsparkGpu {
             prof_n: 0,
             usage: vec![],
             counts: g.alloc_zeroed(nl * ne * 4)?,
-            heat: vec![vec![0.0; ne]; nl],
+            heat: saved_heat.unwrap_or_else(|| vec![vec![0.0; ne]; nl]),
             since_swap: 0,
             swaps: 0,
+            drafts: 0,
+            updates: 0,
+            heat_file: Self::heat_path(dir),
             _zero: zero.context("no draft layers")?,
         };
         anyhow::ensure!(ds.targets.len() == 3, "DSpark reads 3 target layers, config has {:?}", ds.targets);
@@ -624,11 +652,38 @@ impl DsparkGpu {
             }
         }
         self.since_swap += 1;
-        if self.since_swap >= SWAP_EVERY {
-            self.since_swap = 0;
-            self.update_cache(gm)?;
-        }
+        self.drafts += 1;
         Ok((out[1..].to_vec(), conf))
+    }
+
+    /// Between passes (after a verify pass is kept, outside the draft's measured cost): every SWAP_EVERY drafts fold
+    /// the expert pick counters into the heat and swap hotter experts in; now and then save the heat.
+    pub fn maintain(&mut self, gm: &GpuModel) -> Result<()> {
+        if self.since_swap < SWAP_EVERY {
+            return Ok(());
+        }
+        self.since_swap = 0;
+        self.update_cache(gm)?;
+        self.updates += 1;
+        if self.updates % 16 == 0 {
+            self.save_heat();
+        }
+        Ok(())
+    }
+
+    fn heat_path(dir: &Path) -> Option<std::path::PathBuf> {
+        let d = std::env::var_os("DSX_STATE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| dir.to_path_buf());
+        Some(d.join("dspark-heat.json"))
+    }
+
+    /// The draft experts' decayed pick heat, so a restart begins with the experts this machine's use favoured
+    pub fn save_heat(&self) {
+        if let Some(p) = &self.heat_file {
+            let tmp = p.with_extension("json.tmp");
+            if std::fs::write(&tmp, serde_json::to_vec(&self.heat).unwrap_or_default()).is_ok() {
+                let _ = std::fs::rename(&tmp, p);
+            }
+        }
     }
 
     /// Expert cache: fold the pick counters into decayed heat and bring in up to SWAP_MAX experts that are hotter than
@@ -638,7 +693,8 @@ impl DsparkGpu {
         let ne = self.ne;
         let c: Vec<u32> = g.download(self.counts.ptr, self.layers.len() * ne)?;
         g.memset(self.counts.ptr, self.layers.len() * ne * 4)?;
-        let mut budget = SWAP_MAX;
+        // warming up (first 128 drafts): faster
+        let mut budget = if self.drafts < 128 { 4 * SWAP_MAX } else { SWAP_MAX };
         for (li, l) in self.layers.iter_mut().enumerate() {
             let heat = &mut self.heat[li];
             for e in 0..ne {
