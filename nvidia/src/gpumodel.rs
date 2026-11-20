@@ -112,6 +112,8 @@ pub struct GpuModel<'m> {
     head: DMat,
     out_norm: Buf,
     freqs: (Buf, Buf),
+    /// the GPU `with_placement_draft` set the DSpark stack's room aside on
+    pub draft_gpu: i32,
     // work buffers (T = 1)
     h: Buf,
     x: Buf,
@@ -336,6 +338,14 @@ impl<'m> GpuModel<'m> {
     /// `ordinal` < 0: pick the main GPU by measurement (pick_main); every other GPU becomes an aux expert store
     /// unless `pl.aux_gb` is 0.
     pub fn with_placement(m: &'m Model, ordinal: i32, max_ctx: usize, pl: Placement) -> Result<GpuModel<'m>> {
+        Self::with_placement_draft(m, ordinal, max_ctx, pl, 0)
+    }
+
+    /// `with_placement`, leaving `draft` bytes for the DSpark stack on one GPU before experts fill them: the aux GPU
+    /// with the most expert room when the stack takes at most a quarter of it (an aux GPU holds colder experts than
+    /// the main one, and the draft then runs beside the main GPU instead of taking its memory), else the main GPU.
+    /// DSX_DSPARK_GPU=<ordinal> picks one. The choice is `draft_gpu`.
+    pub fn with_placement_draft(m: &'m Model, ordinal: i32, max_ctx: usize, pl: Placement, draft: usize) -> Result<GpuModel<'m>> {
         let probe = if ordinal < 0 || pl.aux_gb != 0.0 { probe_gpus()? } else { vec![] };
         let ordinal = if ordinal >= 0 { ordinal } else { pick_main(&probe) };
         if probe.len() > 1 {
@@ -578,6 +588,7 @@ impl<'m> GpuModel<'m> {
             t_experts: 0.0,
             exp0: None,
             aux: vec![],
+            draft_gpu: -1,
             n_routed: [0; 3],
             ev0: vec![],
             evprof: None,
@@ -592,7 +603,7 @@ impl<'m> GpuModel<'m> {
         }
         // prefill buffers before the experts take the rest of VRAM
         gm.pb = Some(PrefillBufs::new(&gm.g, m, pl.prefill_chunk, max_ctx)?);
-        let gpu0_bytes = if pl.gpu0_gb < 0.0 {
+        let mut gpu0_bytes = if pl.gpu0_gb < 0.0 {
             let (free, _) = gm.g.mem_info()?;
             free.saturating_sub((-pl.gpu0_gb * 1e9) as usize)
         } else {
@@ -634,6 +645,22 @@ impl<'m> GpuModel<'m> {
                     }
                 }
             }
+        }
+        gm.draft_gpu = gm.g.ordinal;
+        if draft > 0 {
+            let want = std::env::var("DSX_DSPARK_GPU").ok().and_then(|v| v.trim().parse::<i32>().ok());
+            let pick = match want {
+                Some(o) => aux_g.iter().position(|a| a.0.ordinal == o && a.1 >= draft),
+                None => aux_g.iter().enumerate().filter(|(_, a)| a.1 >= 4 * draft).max_by_key(|(_, a)| a.1).map(|(i, _)| i),
+            };
+            match pick {
+                Some(i) => {
+                    aux_g[i].1 -= draft;
+                    gm.draft_gpu = aux_g[i].0.ordinal;
+                }
+                None => gpu0_bytes = gpu0_bytes.saturating_sub(draft),
+            }
+            eprintln!("DSpark draft: GPU{} ({:.2} GB set aside)", gm.draft_gpu, draft as f64 / 1e9);
         }
         let mut prior: Vec<(usize, usize, u64)> = vec![];
         // automatic tiering (tier.rs): what this machine learned in earlier runs with this model (and overlay), if anything

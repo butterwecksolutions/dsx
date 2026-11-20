@@ -111,7 +111,8 @@ pub fn real_engine(args: &RealEngineArgs) -> Result<Box<dyn Engine>> {
     } else {
         Model::load(&args.model, args.engram.as_deref(), args.overlay.as_deref())?
     }));
-    // DSpark: its stack lives on the main GPU, so the placement leaves that much room there (a failure only turns it off)
+    // DSpark: the placement leaves room for its stack on an aux GPU with memory to spare, else on the main GPU (a
+    // failure only turns it off)
     // (with session caching too: a state switch only invalidates the draft rings; drafts never affect what is decoded)
     let dspark_dir = args.dspark.as_deref();
     let dspark_need = match dspark_dir.map(crate::gpumodel::DsparkGpu::estimate_bytes) {
@@ -123,15 +124,14 @@ pub fn real_engine(args: &RealEngineArgs) -> Result<Box<dyn Engine>> {
         None => None,
     };
     let need_gb = dspark_need.map_or(0.0, |b| b as f64 / 1e9);
-    let gpu0_gb = if args.gpu0_gb < 0.0 { args.gpu0_gb - need_gb } else { (args.gpu0_gb - need_gb).max(0.0) };
-    let pl = Placement { gpu0_gb, aux_gb: args.gpu1_gb, arena_gb: args.arena_gb, prefill_chunk: args.chunk, rank: args.rank.clone() };
+    let pl = Placement { gpu0_gb: args.gpu0_gb, aux_gb: args.gpu1_gb, arena_gb: args.arena_gb, prefill_chunk: args.chunk, rank: args.rank.clone() };
     let vision = args.vision.as_deref().map(VisionWeights::load).transpose()?;
-    let mut gm = GpuModel::with_placement(m, -1, args.ctx, pl)?;
+    let mut gm = GpuModel::with_placement_draft(m, -1, args.ctx, pl, dspark_need.unwrap_or(0))?;
     let spec = match (dspark_need, dspark_dir) {
-        (Some(_), Some(dir)) => match crate::gpumodel::DsparkGpu::load(&gm, dir) {
+        (Some(_), Some(dir)) => match crate::gpumodel::DsparkGpu::load(&gm, dir, Some(gm.draft_gpu)) {
             Ok(dg) => {
                 gm.capture_hidden(&dg.targets.clone())?;
-                tracing::info!(event = "dspark", gb = dg.bytes as f64 / 1e9, reserved_gb = need_gb, block = dg.block, "speculative decoding on (per token by measured gain)");
+                tracing::info!(event = "dspark", gpu = dg.ordinal, gb = dg.bytes as f64 / 1e9, reserved_gb = need_gb, block = dg.block, "speculative decoding on (per token by measured gain)");
                 let ctl = crate::spec::SpecControl::new(dg.block);
                 Some((dg, ctl))
             }
@@ -1099,9 +1099,7 @@ fn decode_tokens(
             }
             gm.keep(1 + j)?;
             if let Some((dg, ctl)) = spec.as_deref_mut() {
-                for r in 0..=j {
-                    dg.observe_row(&*gm, p0 + r, r)?;
-                }
+                dg.observe_span(&*gm, p0, 0, j + 1)?;
                 for v in &lv[..=j] {
                     ctl.note_conf(crate::spec::top_prob(v));
                 }

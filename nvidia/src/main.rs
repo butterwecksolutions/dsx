@@ -444,13 +444,14 @@ fn main() -> Result<()> {
             let st = dsx::safetensors::SafeTensors::open_prefix(&mtp, "mtp.")?;
             let ds = dsx::dspark::Dspark::load(&m, &st, &mtp)?;
             let chunk = if spec { chunk.max(dsx::handoff::MAXT) } else { 0 };
-            let mut gm = dsx::gpumodel::GpuModel::with_placement(&m, -1, ctx, dsx::gpumodel::Placement { gpu0_gb, aux_gb: gpu1_gb, arena_gb, prefill_chunk: chunk, rank })?;
+            let need = if gpu { dsx::gpumodel::DsparkGpu::estimate_bytes(&mtp)? } else { 0 };
+            let mut gm = dsx::gpumodel::GpuModel::with_placement_draft(&m, -1, ctx, dsx::gpumodel::Placement { gpu0_gb, aux_gb: gpu1_gb, arena_gb, prefill_chunk: chunk, rank }, need)?;
             let pb = gm.pb.take();
             gm.capture_hidden(&ds.targets)?;
             let mut dg = if gpu {
                 let tg = Instant::now();
-                let dg = dsx::gpumodel::DsparkGpu::load(&gm, &mtp)?;
-                eprintln!("DSpark on the GPU: {:.2} GB in {:.1} s", dg.bytes as f64 / 1e9, tg.elapsed().as_secs_f32());
+                let dg = dsx::gpumodel::DsparkGpu::load(&gm, &mtp, Some(gm.draft_gpu))?;
+                eprintln!("DSpark on GPU{}: {:.2} GB in {:.1} s", dg.ordinal, dg.bytes as f64 / 1e9, tg.elapsed().as_secs_f32());
                 Some(dg)
             } else {
                 None
@@ -588,9 +589,7 @@ fn main() -> Result<()> {
                                 j += 1;
                             }
                             gm.keep(1 + j)?;
-                            for r in 0..=j {
-                                dg.observe_row(&gm, p0 + r, r)?;
-                            }
+                            dg.observe_span(&gm, p0, 0, j + 1)?;
                             gm.after_pass(1 + j)?;
                             dg.maintain(&gm)?;
                             for v in &lv[..=j] {
