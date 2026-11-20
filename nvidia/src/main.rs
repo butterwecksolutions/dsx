@@ -482,28 +482,37 @@ fn main() -> Result<()> {
                 if let (Some((snap, lg0)), Some(dg), Some(pb)) = (after_prompt.as_ref(), dg.as_mut(), pb.as_ref()) {
                     // (name, most drafts per pass, confidence threshold: drafts up to the first one below it)
                     dg.set_prof(false);
-                    let variants: [(&str, usize, Option<f32>); 6] = [("block 2", 2, None), ("block 3", 3, None), ("block 5", 5, None), ("conf>0", 5, Some(0.0)), ("conf>1", 5, Some(1.0)), ("conf>2", 5, Some(2.0))];
+                    // "auto": SpecControl picks the draft length per token from live costs and hit rates (0 = plain)
+                    let variants: [(&str, usize, Option<f32>); 4] = [("block 3", 3, None), ("block 5", 5, None), ("conf>1", 5, Some(1.0)), ("auto", 0, None)];
                     for (vname, maxl, thr) in variants {
                         gm.restore(snap)?;
                         dg.restore_rings(&gm)?;
                         let (mut out, mut passes, mut acc, mut steps, mut verified) = (vec![], 0usize, 0usize, 0usize, 0usize);
                         let mut next = top(lg0, 1)[0].0;
+                        let auto = maxl == 0;
+                        let mut ctl = dsx::spec::SpecControl::new(ds.block);
                         let t0 = Instant::now();
                         while out.len() < n {
                             let room = n - out.len() - 1;
-                            let (d, cf) = dg.draft(&gm, gm.pos - 1, next)?;
-                            let mut l = d.len().min(maxl).min(room).min(dsx::handoff::MAXT - 1);
+                            let want = if auto { ctl.choose(room.min(dsx::handoff::MAXT - 1)) } else { maxl.min(room).min(dsx::handoff::MAXT - 1) };
+                            let td = Instant::now();
+                            let (d, cf) = if want > 0 { dg.draft(&gm, gm.pos - 1, next)? } else { (vec![], vec![]) };
+                            let dms = td.elapsed().as_secs_f64() * 1e3;
+                            let mut l = d.len().min(want);
                             if let Some(th) = thr {
                                 l = l.min(cf.iter().take_while(|&&c| c >= th).count());
                             }
                             if l == 0 {
                                 out.push(next);
+                                let ts = Instant::now();
                                 let lg = gm.step(next)?;
+                                ctl.note_step(ts.elapsed().as_secs_f64() * 1e3);
                                 dg.observe(&gm, gm.pos - 1)?;
                                 next = top(&lg, 1)[0].0;
                                 steps += 1;
                                 continue;
                             }
+                            let tv = Instant::now();
                             let mut toks = vec![next];
                             toks.extend_from_slice(&d[..l]);
                             let p0 = gm.pos;
@@ -516,6 +525,7 @@ fn main() -> Result<()> {
                             for r in 0..=j {
                                 dg.observe_row(&gm, p0 + r, r)?;
                             }
+                            ctl.note_pass(l, j, dms, tv.elapsed().as_secs_f64() * 1e3);
                             out.push(next);
                             out.extend_from_slice(&d[..j]);
                             next = top(&lv[j], 1)[0].0;
@@ -528,6 +538,9 @@ fn main() -> Result<()> {
                         let same = out.iter().zip(&seq).take_while(|(a, b)| a == b).count();
                         let tps = n as f64 / el;
                         println!("[{pname}] spec {vname}: {:.2} tok/s vs plain {:.2} = {:.2}x; {passes} verify passes ({acc}/{verified} drafts accepted), {steps} plain steps; same as plain for the first {same}/{n} tokens", tps, 1e3 / step_ms, tps * step_ms / 1e3);
+                        if auto {
+                            println!("[{pname}]   control: step {:.1} ms, draft {:.1} ms, verify ms by T {:?}, hit {:?}", ctl.step_ms, ctl.draft_ms, ctl.verify_ms.iter().skip(1).map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>(), ctl.hit.iter().map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>());
+                        }
                         runs.push(format!("{{\"name\":\"{vname}\",\"tps\":{tps:.3},\"x\":{:.4},\"passes\":{passes},\"accepted\":{acc},\"verified\":{verified},\"steps\":{steps},\"same\":{same}}}", tps * step_ms / 1e3));
                     }
                 }

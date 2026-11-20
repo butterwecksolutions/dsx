@@ -283,6 +283,7 @@ impl DsparkGpu {
             prof_n: 0,
         };
         anyhow::ensure!(ds.targets.len() == 3, "DSpark reads 3 target layers, config has {:?}", ds.targets);
+        eprintln!("dspark: main head {:?} {}x{} (q8r {}, q6 {})", gm.head.ty, gm.head.rows, gm.head.cols, gm.head.q8r, gm.head.q6.is_some());
         let (free1, _) = g.mem_info()?;
         Ok(DsparkGpu { bytes: free0.saturating_sub(free1), ..ds })
     }
