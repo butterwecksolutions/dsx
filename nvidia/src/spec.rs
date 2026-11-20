@@ -42,7 +42,13 @@ pub struct SpecControl {
     /// the main model's top probability (EMA over tokens) and its level when drafting last paid
     pub conf: f64,
     pub conf_paid: f64,
+    /// which verify sizes have been measured; unmeasured ones are extrapolated from them, so a size is never
+    /// written off on its prior alone; every EXPLORE_EVERY passes the next longer draft is tried when close
+    measured: Vec<bool>,
+    passes: usize,
 }
+
+pub const EXPLORE_EVERY: usize = 24;
 
 pub const PROBE_MIN: usize = 16;
 pub const PROBE_MAX: usize = 256;
@@ -61,6 +67,8 @@ impl SpecControl {
             probing: false,
             conf: 0.0,
             conf_paid: 1.0,
+            measured: vec![false; max + 2],
+            passes: 0,
         }
     }
 
@@ -78,7 +86,24 @@ impl SpecControl {
             reach *= self.hit[i];
             exp += reach;
         }
-        exp / (self.draft_ms + self.verify_ms[l + 1])
+        exp / (self.draft_ms + self.verify_cost(l + 1))
+    }
+
+    /// ms for a verify pass of `t` tokens: measured, else on the line through the plain step (t = 1) and the
+    /// measured sizes (least squares), else the prior
+    pub fn verify_cost(&self, t: usize) -> f64 {
+        if self.measured[t] {
+            return self.verify_ms[t];
+        }
+        let pts: Vec<(f64, f64)> = std::iter::once((1.0, self.step_ms)).chain((2..self.verify_ms.len()).filter(|&u| self.measured[u]).map(|u| (u as f64, self.verify_ms[u]))).collect();
+        if pts.len() < 2 {
+            return self.verify_ms[t];
+        }
+        let n = pts.len() as f64;
+        let (mx, my) = (pts.iter().map(|p| p.0).sum::<f64>() / n, pts.iter().map(|p| p.1).sum::<f64>() / n);
+        let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+        let slope = if sxx > 0.0 { pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>() / sxx } else { 0.0 };
+        (my + slope.max(0.0) * (t as f64 - mx)).max(self.step_ms)
     }
 
     /// draft length for the next token (0 = plain), at most `room`
@@ -87,9 +112,13 @@ impl SpecControl {
         let rates: Vec<f64> = (0..=room).map(|l| self.rate(l)).collect();
         let top = rates.iter().cloned().fold(0.0, f64::max);
         // within 2 % the longer draft: its estimate rests on more evidence and the verify cost is flat per token
-        let best = (0..=room).rev().find(|&l| rates[l] >= 0.98 * top).unwrap_or(0);
+        let mut best = (0..=room).rev().find(|&l| rates[l] >= 0.98 * top).unwrap_or(0);
         self.probing = false;
         if best > 0 || room == 0 {
+            // now and then one longer, if it is not clearly worse: the estimate for it then rests on a measurement
+            if best < room && self.passes % EXPLORE_EVERY == EXPLORE_EVERY - 1 && rates[best + 1] >= 0.9 * rates[best] {
+                best += 1;
+            }
             self.since_probe = 0;
             return best;
         }
@@ -116,7 +145,13 @@ impl SpecControl {
     /// a pass drafted `l` (taking `draft_ms`), verified them in `verify_ms`, accepted `j`
     pub fn note_pass(&mut self, l: usize, j: usize, draft_ms: f64, verify_ms: f64) {
         Self::ema(&mut self.draft_ms, draft_ms, 0.2);
-        Self::ema(&mut self.verify_ms[l + 1], verify_ms, 0.2);
+        if self.measured[l + 1] {
+            Self::ema(&mut self.verify_ms[l + 1], verify_ms, 0.2);
+        } else {
+            self.verify_ms[l + 1] = verify_ms;
+            self.measured[l + 1] = true;
+        }
+        self.passes += 1;
         for i in 0..l.min(j + 1) {
             Self::ema(&mut self.hit[i], if i < j { 1.0 } else { 0.0 }, 0.15);
         }
@@ -179,5 +214,12 @@ mod tests {
         c.note_conf(1.0);
         assert!((1..=8).any(|_| c.choose(5) > 0));
         assert!((super::top_prob(&[0.0, 0.0]) - 0.5).abs() < 1e-9);
+        // unmeasured sizes follow the measured ones: T=6 is not written off on a pessimistic prior
+        let mut c = super::SpecControl::new(5);
+        c.step_ms = 25.0;
+        c.verify_ms[6] = 200.0;
+        c.note_pass(3, 3, 9.0, 50.0);
+        c.note_pass(4, 4, 9.0, 60.0);
+        assert!(c.verify_cost(6) < 80.0, "{}", c.verify_cost(6));
     }
 }
