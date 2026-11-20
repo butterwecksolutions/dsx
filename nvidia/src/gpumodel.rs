@@ -649,18 +649,24 @@ impl<'m> GpuModel<'m> {
         gm.draft_gpu = gm.g.ordinal;
         if draft > 0 {
             let want = std::env::var("DSX_DSPARK_GPU").ok().and_then(|v| v.trim().parse::<i32>().ok());
+            // on an aux GPU the stack also needs a copy of the main head, its own kernel module and scratch
+            let aux_need = draft + gm.head.buf.bytes + gm.head.scale.as_ref().map_or(0, |s| s.bytes) + (512 << 20);
             let pick = match want {
-                Some(o) => aux_g.iter().position(|a| a.0.ordinal == o && a.1 >= draft),
-                None => aux_g.iter().enumerate().filter(|(_, a)| a.1 >= 4 * draft).max_by_key(|(_, a)| a.1).map(|(i, _)| i),
+                Some(o) => aux_g.iter().position(|a| a.0.ordinal == o && a.1 >= aux_need),
+                None => aux_g.iter().enumerate().filter(|(_, a)| a.1 >= 4 * aux_need).max_by_key(|(_, a)| a.1).map(|(i, _)| i),
             };
-            match pick {
+            let set = match pick {
                 Some(i) => {
-                    aux_g[i].1 -= draft;
+                    aux_g[i].1 -= aux_need;
                     gm.draft_gpu = aux_g[i].0.ordinal;
+                    aux_need
                 }
-                None => gpu0_bytes = gpu0_bytes.saturating_sub(draft),
-            }
-            eprintln!("DSpark draft: GPU{} ({:.2} GB set aside)", gm.draft_gpu, draft as f64 / 1e9);
+                None => {
+                    gpu0_bytes = gpu0_bytes.saturating_sub(draft);
+                    draft
+                }
+            };
+            eprintln!("DSpark draft: GPU{} ({:.2} GB set aside)", gm.draft_gpu, set as f64 / 1e9);
         }
         let mut prior: Vec<(usize, usize, u64)> = vec![];
         // automatic tiering (tier.rs): what this machine learned in earlier runs with this model (and overlay), if anything

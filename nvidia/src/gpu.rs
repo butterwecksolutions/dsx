@@ -465,6 +465,8 @@ impl Gpu {
 
     /// record `e` on the main (side = false) or side stream
     pub fn record(&self, e: Event, side: bool) -> Result<()> {
+        // the stream is this context's: another context current (a DSpark draft on an aux GPU) fails the record
+        self.bind();
         unsafe { check(cu::cuEventRecord(e.0, if side { self.side } else { self.stream }), "cuEventRecord") }
     }
 
@@ -518,6 +520,7 @@ impl Gpu {
 
     /// join: record `e` on the par stream (the main stream waits for it with `wait(e, false)`)
     pub fn record_par(&self, e: Event) -> Result<()> {
+        self.bind();
         unsafe { check(cu::cuEventRecord(e.0, self.par), "cuEventRecord") }
     }
 

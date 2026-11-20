@@ -187,6 +187,16 @@ struct Dev<'a> {
     main: Option<&'a GpuModel<'a>>,
 }
 
+/// Makes the main GPU's context current again when dropped: the decode path's raw stream calls expect it after a
+/// draft or observe ran on another GPU
+struct Rebind<'a>(&'a Gpu);
+
+impl Drop for Rebind<'_> {
+    fn drop(&mut self) {
+        self.0.bind();
+    }
+}
+
 /// rows of hc-means one observe batch moves (a prompt's last window goes in a few batches)
 const MH_ROWS: usize = 64;
 
@@ -355,6 +365,7 @@ impl DsparkGpu {
     /// Upload the draft stack from the checkpoint directory holding config.json, the index and the mtp.* shards.
     /// `ordinal`: the GPU to put it on (None or the main GPU's: the main GPU)
     pub fn load(gm: &GpuModel, dir: &Path, ordinal: Option<i32>) -> Result<DsparkGpu> {
+        let _rb = Rebind(&gm.g);
         let side = match ordinal {
             Some(o) if o != gm.g.ordinal => Some(Side::new(gm, o).with_context(|| format!("DSpark context on GPU{o}"))?),
             _ => None,
@@ -615,6 +626,7 @@ impl DsparkGpu {
     /// batches of MH_ROWS; on another draft GPU they cross over the host (3 x dim floats per row), then the draft GPU
     /// projects each into every layer's window ring.
     fn observe_rows(&mut self, gm: &GpuModel, base: u64, rows_per_layer: usize, items: &[(usize, usize)]) -> Result<()> {
+        let _rb = Rebind(&gm.g);
         let c = &gm.m.cfg;
         let (d, hd, w) = (c.dim, c.head_dim, c.window);
         anyhow::ensure!(gm.hid_layers == self.targets, "captured layers {:?}, DSpark reads {:?}", gm.hid_layers, self.targets);
@@ -666,6 +678,7 @@ impl DsparkGpu {
 
     /// Copy the window rings aside / back (with GpuModel::snapshot / restore)
     pub fn save_rings(&mut self, gm: &GpuModel) -> Result<()> {
+        let _rb = Rebind(&gm.g);
         let n = gm.m.cfg.window * gm.m.cfg.head_dim * 2;
         if self.ring_saved.is_empty() {
             for _ in &self.layers {
@@ -680,6 +693,7 @@ impl DsparkGpu {
     }
 
     pub fn restore_rings(&mut self, gm: &GpuModel) -> Result<()> {
+        let _rb = Rebind(&gm.g);
         self.seen = self.seen_saved;
         let n = gm.m.cfg.window * gm.m.cfg.head_dim * 2;
         for (l, s) in self.layers.iter().zip(&self.ring_saved) {
@@ -718,6 +732,7 @@ impl DsparkGpu {
     /// Draft `block` tokens after position `pos`, whose next token (sampled by the main model, not yet fed) is
     /// `next`. Returns (drafts, confidence): drafts[i] is the guess for position pos + 2 + i.
     pub fn draft(&mut self, gm: &GpuModel, pos: usize, next: u32) -> Result<(Vec<u32>, Vec<f32>)> {
+        let _rb = Rebind(&gm.g);
         let m = gm.m;
         let c = &m.cfg;
         let (d, hc, hd, nh, w, bl) = (c.dim, c.hc, c.head_dim, c.n_heads, c.window, self.block);
@@ -896,6 +911,7 @@ impl DsparkGpu {
     /// Expert cache: fold the pick counters into decayed heat and bring in up to SWAP_MAX experts that are hotter than
     /// the coldest resident ones (from the checkpoint mapping on the host; between drafts).
     fn update_cache(&mut self, gm: &GpuModel) -> Result<()> {
+        let _rb = Rebind(&gm.g);
         let g: &Gpu = self.side.as_ref().map_or(&gm.g, |s| &s.g);
         let ne = self.ne;
         let c: Vec<u32> = g.download(self.counts.ptr, self.layers.len() * ne)?;
