@@ -129,6 +129,9 @@ pub struct DsparkGpu {
     /// device memory the stack took (weights and scratch)
     pub bytes: usize,
     ring_saved: Vec<Buf>,
+    /// (first, last) position of the contiguous run the rings hold; None = nothing usable
+    seen: Option<(usize, usize)>,
+    seen_saved: Option<(usize, usize)>,
     prof_on: bool,
     prof: Vec<(&'static str, f64)>,
     prof_n: usize,
@@ -149,6 +152,16 @@ fn bf16mat(g: &Gpu, v: &[f32], rows: usize) -> Result<DMat> {
 }
 
 impl DsparkGpu {
+    /// Device bytes `load` will take (weights, the bf16 Markov table, scratch), from the index alone: the placement
+    /// sets this much aside on the main GPU before it fills it with experts.
+    pub fn estimate_bytes(dir: &Path) -> Result<usize> {
+        let st = SafeTensors::open_prefix(dir, "mtp.")?;
+        let w: usize = st.tensors.values().map(|t| t.end - t.start).sum();
+        // F32 / BF16 vectors are uploaded as f32 (at most 2x), the Markov embedding again as a bf16 table
+        let extra: usize = st.tensors.iter().filter(|(k, t)| t.dtype != "I8" && t.dtype != "F8_E4M3" && !k.contains("experts")).map(|(_, t)| t.end - t.start).sum();
+        Ok(w + 2 * extra + (256 << 20))
+    }
+
     /// Upload the draft stack from the checkpoint directory holding config.json, the index and the mtp.* shards.
     pub fn load(gm: &GpuModel, dir: &Path) -> Result<DsparkGpu> {
         let (m, g): (&Model, &Gpu) = (gm.m, &gm.g);
@@ -278,6 +291,8 @@ impl DsparkGpu {
             ne,
             bytes: 0,
             ring_saved: vec![],
+            seen: None,
+            seen_saved: None,
             prof_on: std::env::var_os("DSX_DSPARK_PROF").is_some(),
             prof: vec![],
             prof_n: 0,
@@ -291,17 +306,50 @@ impl DsparkGpu {
     /// The main model just processed position `pos` (its `step` captured row 0, a verify pass row t per token, of
     /// the target layers' residuals): project row `t` into every draft layer's window ring (the reference `observe`).
     pub fn observe_row(&mut self, gm: &GpuModel, pos: usize, t: usize) -> Result<()> {
+        let hid = gm.hid_buf.as_ref().context("capture_hidden(targets) first")?.ptr;
+        anyhow::ensure!(t < crate::handoff::MAXT, "observe row {t}");
+        self.observe_from(gm, pos, hid, crate::handoff::MAXT, t)
+    }
+
+    /// After a prompt pass (prefill): the captured last <= window rows of the prompt (GpuModel::hid_pre_span).
+    pub fn observe_prefill(&mut self, gm: &GpuModel) -> Result<()> {
+        let (p0, n) = gm.hid_pre_span;
+        let Some(hp) = gm.hid_pre.as_ref() else { return Ok(()) };
+        for r in 0..n {
+            self.observe_from(gm, p0 + r, hp.ptr, gm.m.cfg.window, r)?;
+        }
+        Ok(())
+    }
+
+    /// The window rings no longer match the model state (restore, reset): drafts start over from the next observed
+    /// position.
+    pub fn invalidate(&mut self) {
+        self.seen = None;
+    }
+
+    /// Positions the rings hold for the main model now at `pos`: the newest window of a contiguous run of observes.
+    fn valid_from(&self, pos: usize, w: usize) -> Option<usize> {
+        let (lo, hi) = self.seen?;
+        (hi == pos).then(|| lo.max((pos + 1).saturating_sub(w)))
+    }
+
+    fn observe_from(&mut self, gm: &GpuModel, pos: usize, base: u64, rows_per_layer: usize, t: usize) -> Result<()> {
         let c = &gm.m.cfg;
         let (d, hd, w) = (c.dim, c.head_dim, c.window);
-        let hid = gm.hid_buf.as_ref().context("capture_hidden(targets) first")?;
         anyhow::ensure!(gm.hid_layers == self.targets, "captured layers {:?}, DSpark reads {:?}", gm.hid_layers, self.targets);
-        anyhow::ensure!(t < crate::handoff::MAXT, "observe row {t}");
+        // contiguous with what the rings hold, else a new run starts here
+        self.seen = match self.seen {
+            Some((lo, hi)) if pos == hi + 1 => Some((lo, pos)),
+            Some((lo, hi)) if pos <= hi && pos >= lo => Some((lo, pos)),
+            _ => Some((pos, pos)),
+        };
+        let hid = base;
         let g = &gm.g;
         let b = &self.b;
         let row = c.hc * d * 4;
         // main_hidden: per target layer the mean of the hc streams, bf16 (hc_pre with 1/4 weights rounds)
         for k in 0..3 {
-            g.launch(gm.k["hc_pre"], (1, 1, 1), 256, 0, &[Arg::P(hid.ptr + ((k * crate::handoff::MAXT + t) * row) as u64), Arg::P(b.mhmix.ptr), Arg::I(0), Arg::P(b.mh.ptr + (k * d * 4) as u64), Arg::I(d as i32)])?;
+            g.launch(gm.k["hc_pre"], (1, 1, 1), 256, 0, &[Arg::P(hid + ((k * rows_per_layer + t) * row) as u64), Arg::P(b.mhmix.ptr), Arg::I(0), Arg::P(b.mh.ptr + (k * d * 4) as u64), Arg::I(d as i32)])?;
         }
         gm.gemv(&self.main_proj, b.mh.ptr, b.mx.ptr)?;
         gm.rmsnorm(b.mx.ptr, &self.main_norm, b.mx.ptr, d, true)?;
@@ -330,10 +378,12 @@ impl DsparkGpu {
         for (l, s) in self.layers.iter().zip(&self.ring_saved) {
             gm.g.dtod(s.ptr, l.ring.ptr, n)?;
         }
+        self.seen_saved = self.seen;
         Ok(())
     }
 
-    pub fn restore_rings(&self, gm: &GpuModel) -> Result<()> {
+    pub fn restore_rings(&mut self, gm: &GpuModel) -> Result<()> {
+        self.seen = self.seen_saved;
         let n = gm.m.cfg.window * gm.m.cfg.head_dim * 2;
         for (l, s) in self.layers.iter().zip(&self.ring_saved) {
             gm.g.dtod(l.ring.ptr, s.ptr, n)?;
@@ -383,8 +433,14 @@ impl DsparkGpu {
         }
         g.htod_sync(b.mix_f.ptr, &pre)?;
         g.htod_sync(b.pos.ptr, &(0..bl).map(|i| (pos + 1 + i) as i32).collect::<Vec<i32>>())?;
-        let nwin = w.min(pos + 1);
-        let widx: Vec<i32> = (0..bl * w).map(|j| if j % w < nwin { (j % w) as i32 } else { -1 }).collect();
+        // ring slots of the positions observed in the current run (a slot outside it holds another sequence's row)
+        let lo = self.valid_from(pos, w).context("draft without observed positions (observe the main model first)")?;
+        // slot s holds the newest position p <= pos with p % w == s
+        let slot = |s: usize| -> i32 {
+            let off = (pos % w + w - s) % w;
+            if off <= pos && pos - off >= lo { s as i32 } else { -1 }
+        };
+        let widx: Vec<i32> = (0..bl * w).map(|j| slot(j % w)).collect();
         g.htod_sync(b.win_idx.ptr, &widx)?;
         let gsz = nh * hd / c.o_groups;
         pf.mark(g, "setup");

@@ -40,6 +40,16 @@ enum Cmd {
         #[arg(short, default_value_t = 32)]
         n: usize,
     },
+    /// Download DSpark's draft weights (only the checkpoint shards holding `mtp.*`, ~8 GB of ~150) plus config.json and
+    /// the index into DIR, resumably, each shard checked against the hub's SHA-256. Uses `curl` and `sha256sum`.
+    FetchMtp {
+        dir: PathBuf,
+        #[arg(long, default_value = "deepseek-ai/DeepSeek-V4.1-Flash-1017")]
+        repo: String,
+        /// base URL of the hub (a mirror may be given)
+        #[arg(long, default_value = "https://huggingface.co")]
+        hub: String,
+    },
     /// DSpark acceptance on the GPU engine (a GGUF plus the checkpoint's mtp.* shards): greedy decode on the GPUs, a
     /// draft from the CPU reference after every token, scored against the tokens the model actually produces next.
     /// Prints one `dspark-json` line (per draft: accepted count and confidences) for offline cost models.
@@ -265,6 +275,57 @@ fn load(p: &std::path::Path, engram: Option<&std::path::Path>) -> Result<Model> 
     if p.is_dir() { Model::load_hf(p) } else { Model::load(p, engram, overlay.as_deref()) }
 }
 
+/// `dsx fetch-mtp`: the draft shards of the official checkpoint, nothing else
+fn fetch_mtp(dir: &std::path::Path, repo: &str, hub: &str) -> Result<()> {
+    use std::process::Command;
+    std::fs::create_dir_all(dir)?;
+    let base = format!("{}/{repo}/resolve/main", hub.trim_end_matches('/'));
+    let curl = |name: &str, extra: &[&str]| -> Result<()> {
+        let st = Command::new("curl").args(["-fL", "--retry", "5", "--retry-delay", "5", "-C", "-", "-o"]).arg(dir.join(name)).args(extra).arg(format!("{base}/{name}")).status()?;
+        anyhow::ensure!(st.success(), "curl {name}: {st}");
+        Ok(())
+    };
+    // HEAD: size and, for LFS files, the SHA-256 (x-linked-etag)
+    let head = |name: &str| -> Result<(Option<u64>, Option<String>)> {
+        let out = Command::new("curl").args(["-fsIL"]).arg(format!("{base}/{name}")).output()?;
+        anyhow::ensure!(out.status.success(), "HEAD {name}: {}", String::from_utf8_lossy(&out.stderr));
+        let txt = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        let field = |k: &str| txt.lines().rev().find_map(|l| l.strip_prefix(k).map(|v| v.trim().trim_matches('"').to_string()));
+        let size = field("x-linked-size:").or_else(|| field("content-length:")).and_then(|v| v.parse().ok());
+        Ok((size, field("x-linked-etag:")))
+    };
+    for f in ["config.json", "model.safetensors.index.json"] {
+        let _ = std::fs::remove_file(dir.join(f));
+        curl(f, &[])?;
+    }
+    let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json"))?)?;
+    let mut shards: Vec<String> = idx["weight_map"].as_object().ok_or_else(|| anyhow::anyhow!("index without weight_map"))?.iter().filter(|(k, _)| k.starts_with("mtp.")).filter_map(|(_, v)| v.as_str().map(String::from)).collect();
+    shards.sort();
+    shards.dedup();
+    anyhow::ensure!(!shards.is_empty(), "{repo}: no mtp.* tensors in the index");
+    for s in &shards {
+        let (size, sha) = head(s)?;
+        let have = std::fs::metadata(dir.join(s)).map(|m| m.len()).ok();
+        if have.is_some() && have == size {
+            eprintln!("{s}: present ({} GB)", size.unwrap_or(0) as f64 / 1e9);
+        } else {
+            eprintln!("{s}: downloading {} GB", size.unwrap_or(0) as f64 / 1e9);
+            curl(s, &[])?;
+        }
+        if let Some(want) = sha.filter(|h| h.len() == 64) {
+            let out = Command::new("sha256sum").arg(dir.join(s)).output()?;
+            let got = String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string();
+            if got != want {
+                let _ = std::fs::remove_file(dir.join(s));
+                anyhow::bail!("{s}: SHA-256 {got} != {want} (removed; run again)");
+            }
+        }
+    }
+    let st = dsx::safetensors::SafeTensors::open_prefix(dir, "mtp.")?;
+    eprintln!("DSpark weights complete in {}: {} tensors in {} shards", dir.display(), st.tensors.len(), shards.len());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Ref { model, engram, ids, n, dump_logits } => {
@@ -360,6 +421,7 @@ fn main() -> Result<()> {
             }
             println!("generated ids: {seq:?}");
         }
+        Cmd::FetchMtp { dir, repo, hub } => fetch_mtp(&dir, &repo, &hub)?,
         #[cfg(feature = "cuda")]
         Cmd::SpecDraft { model, engram, mtp, ids, n, ctx, gpu0_gb, gpu1_gb, arena_gb, rank, gpu, check_cpu, spec, chunk } => {
             // one or more prompts (';' separated, each comma/whitespace ids or @file), measured in one load
@@ -525,6 +587,7 @@ fn main() -> Result<()> {
                             for r in 0..=j {
                                 dg.observe_row(&gm, p0 + r, r)?;
                             }
+                            gm.after_pass(1 + j)?;
                             ctl.note_pass(l, j, dms, tv.elapsed().as_secs_f64() * 1e3);
                             out.push(next);
                             out.extend_from_slice(&d[..j]);

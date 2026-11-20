@@ -152,6 +152,10 @@ pub struct GpuModel<'m> {
     /// DSpark: layers whose input residual `step` copies aside (`capture_hidden`), and where to
     hid_layers: Vec<usize>,
     hid_buf: Option<Buf>,
+    /// DSpark: a prompt pass's residuals of its last <= window rows per target layer ([layer][window][hc][dim]) and
+    /// (first position, rows) of the last pass that wrote them
+    hid_pre: Option<Buf>,
+    pub hid_pre_span: (usize, usize),
     candidates: Vec<bool>,
     engram_hist: Vec<i64>,
     /// routed experts on the CPU pool (GSQ block types); None = reference matvec (FP4 checkpoint)
@@ -558,6 +562,8 @@ impl<'m> GpuModel<'m> {
             topk_rows: vec![],
             hid_layers: vec![],
             hid_buf: None,
+            hid_pre: None,
+            hid_pre_span: (0, 0),
             candidates: vec![],
             engram_hist: vec![],
             cpu_moe: if matches!(m.src, crate::model::Source::Gguf(_)) {
@@ -2106,6 +2112,8 @@ impl<'m> GpuModel<'m> {
     pub fn capture_hidden(&mut self, layers: &[usize]) -> Result<()> {
         let c = &self.m.cfg;
         self.hid_buf = if layers.is_empty() { None } else { Some(self.g.alloc(layers.len() * crate::handoff::MAXT * c.hc * c.dim * 4)?) };
+        self.hid_pre = if layers.is_empty() || self.pb.is_none() { None } else { Some(self.g.alloc(layers.len() * c.window * c.hc * c.dim * 4)?) };
+        self.hid_pre_span = (0, 0);
         self.hid_layers = layers.to_vec();
         Ok(())
     }
@@ -2120,6 +2128,28 @@ impl<'m> GpuModel<'m> {
             .map(|c| &c[..hc * d])
             .flat_map(|h| (0..d).map(move |i| crate::numerics::round_bf16((0..hc).map(|k| h[k * d + i]).sum::<f32>() / hc as f32)))
             .collect())
+    }
+
+    /// After a speculative verify pass and `keep(k)`: the between-token work `step` does after its logits (expert
+    /// exchanges, tiering moves and bookkeeping), so placement keeps adapting while most tokens come from passes.
+    pub fn after_pass(&mut self, k: usize) -> Result<()> {
+        self.tier_tokens += k as u64;
+        if self.adapt > 0 || self.tier_swap {
+            self.adapt_commit()?;
+            if self.adapt > 0 {
+                self.adapt_step()?;
+            }
+        }
+        if self.tier_swap && self.tier_tokens % crate::tier::WORK_MOVE_EVERY < k as u64 {
+            self.tier_step(false)?;
+        }
+        self.tier_collect()?;
+        if let Some(w) = self.worker.as_ref() {
+            for (i, v) in self.adapt_flags.drain(..) {
+                w.on_cpu[i].store(v, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(())
     }
 
     pub fn step(&mut self, token: u32) -> Result<Vec<f32>> {

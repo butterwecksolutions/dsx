@@ -759,6 +759,13 @@ impl GpuModel<'_> {
                 let row = hc * d * 4;
                 self.g.dtod(b.ptr + (k * crate::handoff::MAXT * row) as u64, pb.h.ptr, tn * row)?;
             }
+            if let (true, Some(k), Some(b)) = (self.verify_t == 0 && last, self.hid_layers.iter().position(|&x| x == li), self.hid_pre.as_ref()) {
+                // DSpark: a prompt chunk's last <= window rows at a target layer (the cone always computes them)
+                let row = hc * d * 4;
+                let first = tn.saturating_sub(w).max(r0);
+                self.g.dtod(b.ptr + (k * w * row) as u64, pb.h.ptr + (first * row) as u64, (tn - first) * row)?;
+                self.hid_pre_span = (p0 + first, tn - first);
+            }
             let hrow = |base: u64, width: usize| base + (r0 * width * 4) as u64;
             // attention half
             let l = &self.layers[li];
