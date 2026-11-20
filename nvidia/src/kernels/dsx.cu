@@ -1275,6 +1275,12 @@ extern "C" __global__ void gemv_fp4_sel(const unsigned long long *wtab, const un
   }
 }
 
+// DSpark expert cache: counts[sel[i]] += 1 for the n picks of a draft layer (which experts to keep resident)
+extern "C" __global__ void dsp_count(const int *sel, int n, unsigned *counts, int E) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && sel[i] >= 0 && sel[i] < E) atomicAdd(&counts[sel[i]], 1u);
+}
+
 // a[t] = bf16(sum_j ey[t * K + j] + sh[t]) (the reference's order: routed picks, then the shared expert). Grid T
 extern "C" __global__ void dsp_moe_sum(float *a, const float *ey, const float *sh, int d, int K) {
   int t = blockIdx.x;

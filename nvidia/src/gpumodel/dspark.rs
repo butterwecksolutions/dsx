@@ -41,9 +41,15 @@ struct DLayer {
     hc_ffn: (DMat, Buf, Buf),
     gate_w: DMat,
     gate_bias: Buf,
-    /// [expert] (gate w1, up w3, down w2), FP4: owns the buffers `wtab` / `stab` point into
-    #[allow(dead_code)]
-    experts: Vec<[DMat; 3]>,
+    /// expert cache: every expert's (gate w1, up w3, down w2) FP4 matrices on the host (the checkpoint mapping), the
+    /// resident ones in `slots`; `wtab` / `stab` point a resident expert at its slot and any other at zeros (a draft
+    /// expert that is not resident adds nothing: drafts are guesses, the verify pass keeps decoding exact)
+    host: Vec<[Mat; 3]>,
+    slots: Vec<[DMat; 3]>,
+    slot_of: Vec<Option<usize>>,
+    who: Vec<usize>,
+    wtab_h: [Vec<u64>; 3],
+    stab_h: [Vec<u64>; 3],
     /// per matrix (gate, up, down): device tables of every expert's weight and scale pointers, for gemv_fp4_sel
     wtab: [Buf; 3],
     stab: [Buf; 3],
@@ -88,6 +94,10 @@ struct Bufs {
     mx: Buf,      // [d]
     kvo: Buf,     // [hd]
 }
+
+/// expert cache: counters folded and swaps considered every SWAP_EVERY drafts, at most SWAP_MAX experts per update
+const SWAP_EVERY: usize = 16;
+const SWAP_MAX: usize = 2;
 
 /// per-section timing of one draft (synchronizes at every mark when on)
 struct Prof {
@@ -137,6 +147,12 @@ pub struct DsparkGpu {
     prof_n: usize,
     /// DSX_DSPARK_PROF: draft expert picks per layer
     usage: Vec<Vec<u64>>,
+    /// expert cache: device pick counters [layer][expert], their decayed host sums, drafts since the last update
+    counts: Buf,
+    heat: Vec<Vec<f64>>,
+    since_swap: usize,
+    pub swaps: usize,
+    _zero: [DMat; 3],
 }
 
 fn up(g: &Gpu, w: &Mat) -> Result<DMat> {
@@ -158,7 +174,9 @@ impl DsparkGpu {
     /// sets this much aside on the main GPU before it fills it with experts.
     pub fn estimate_bytes(dir: &Path) -> Result<usize> {
         let st = SafeTensors::open_prefix(dir, "mtp.")?;
-        let w: usize = st.tensors.values().map(|t| t.end - t.start).sum();
+        let ne = 128.0f64;
+        let slots = std::env::var("DSX_DSPARK_SLOTS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(32.0).clamp(1.0, ne);
+        let w: usize = st.tensors.iter().map(|(k, t)| if k.contains(".ffn.experts.") { ((t.end - t.start) as f64 * (slots + 1.0) / ne) as usize } else { t.end - t.start }).sum();
         // F32 / BF16 vectors are uploaded as f32 (at most 2x), the Markov embedding again as a bf16 table
         let extra: usize = st.tensors.iter().filter(|(k, t)| t.dtype != "I8" && t.dtype != "F8_E4M3" && !k.contains("experts")).map(|(_, t)| t.end - t.start).sum();
         Ok(w + 2 * extra + (256 << 20))
@@ -181,18 +199,50 @@ impl DsparkGpu {
         let mat = |n: &str| crate::model::hf_mat_pub(&st, n);
         let v = |n: &str| -> Result<Vec<f32>> { Ok(crate::model::mat_f32_pub(&mat(n)?)) };
         let (d, hd, w) = (c.dim, c.head_dim, c.window);
+        // resident draft experts per layer (DSX_DSPARK_SLOTS, default 32 of 128: they took 94-100 % of the picks)
+        let nslots = std::env::var("DSX_DSPARK_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(32).clamp(1, ne);
+        let mut zero: Option<[DMat; 3]> = None;
         let mut layers = vec![];
         for l in 0..nl {
             let p = |s: &str| format!("mtp.{l}.{s}");
             let mut o_a = mat(&p("attn.wo_a.weight"))?;
             o_a.act_fp8 = false; // the reference fake-quantizes o per group itself
-            let ex = |e: usize, wn: &str| -> Result<DMat> { up(g, &mat(&p(&format!("ffn.experts.{e}.{wn}.weight")))?) };
-            let experts = (0..ne).map(|e| Ok([ex(e, "w1")?, ex(e, "w3")?, ex(e, "w2")?])).collect::<Result<Vec<[DMat; 3]>>>()?;
-            anyhow::ensure!(experts.iter().all(|x| x.iter().all(|m| m.ty == GType::Fp4)), "draft experts are not checkpoint FP4");
-            let tab = |j: usize, s: bool| -> Result<Buf> {
-                g.upload(&experts.iter().map(|x| if s { x[j].scale.as_ref().unwrap().ptr } else { x[j].buf.ptr }).collect::<Vec<u64>>())
+            let ex = |e: usize, wn: &str| -> Result<Mat> { mat(&p(&format!("ffn.experts.{e}.{wn}.weight"))) };
+            let host = (0..ne).map(|e| Ok([ex(e, "w1")?, ex(e, "w3")?, ex(e, "w2")?])).collect::<Result<Vec<[Mat; 3]>>>()?;
+            anyhow::ensure!(host.iter().all(|x| x.iter().all(|m| m.ty == GType::Fp4)), "draft experts are not checkpoint FP4");
+            if zero.is_none() {
+                // one all-zero expert (weights and E8M0 scales 0 = 2^-127 ~ 0): what a non-resident pick reads
+                let z = |m: &Mat| -> Result<DMat> {
+                    Ok(DMat { buf: g.alloc_zeroed(m.bytes().len())?, scale: Some(g.alloc_zeroed(m.scale_bytes().len())?), ty: m.ty, rows: m.rows, cols: m.cols, act_fp8: m.act_fp8, q8r: false, q6: None })
+                };
+                zero = Some([z(&host[0][0])?, z(&host[0][1])?, z(&host[0][2])?]);
+            }
+            let zr = zero.as_ref().unwrap();
+            // first residents: the router's bias favours them (no use measured yet)
+            let bias = v(&p("ffn.gate.bias"))?;
+            let mut order: Vec<usize> = (0..ne).collect();
+            order.sort_by(|&a, &b| bias[b].total_cmp(&bias[a]));
+            let mut slots = vec![];
+            let mut slot_of = vec![None; ne];
+            let mut who = vec![];
+            for &e in order.iter().take(nslots) {
+                slot_of[e] = Some(slots.len());
+                who.push(e);
+                slots.push([up(g, &host[e][0])?, up(g, &host[e][1])?, up(g, &host[e][2])?]);
+            }
+            let ptrs = |j: usize, s: bool| -> Vec<u64> {
+                (0..ne)
+                    .map(|e| {
+                        let m = match slot_of[e] {
+                            Some(i) => &slots[i][j],
+                            None => &zr[j],
+                        };
+                        if s { m.scale.as_ref().unwrap().ptr } else { m.buf.ptr }
+                    })
+                    .collect()
             };
-            let (wtab, stab) = ([tab(0, false)?, tab(1, false)?, tab(2, false)?], [tab(0, true)?, tab(1, true)?, tab(2, true)?]);
+            let (wtab_h, stab_h) = ([ptrs(0, false), ptrs(1, false), ptrs(2, false)], [ptrs(0, true), ptrs(1, true), ptrs(2, true)]);
+            let (wtab, stab) = ([g.upload(&wtab_h[0])?, g.upload(&wtab_h[1])?, g.upload(&wtab_h[2])?], [g.upload(&stab_h[0])?, g.upload(&stab_h[1])?, g.upload(&stab_h[2])?]);
             layers.push(DLayer {
                 attn_norm: f32buf(g, &v(&p("attn_norm.weight"))?)?,
                 ffn_norm: f32buf(g, &v(&p("ffn_norm.weight"))?)?,
@@ -208,7 +258,12 @@ impl DsparkGpu {
                 hc_ffn: (f32mat(g, &v(&p("hc_ffn_fn"))?, 24)?, f32buf(g, &v(&p("hc_ffn_scale"))?)?, f32buf(g, &v(&p("hc_ffn_base"))?)?),
                 gate_w: bf16mat(g, &v(&p("ffn.gate.weight"))?, ne)?,
                 gate_bias: f32buf(g, &v(&p("ffn.gate.bias"))?)?,
-                experts,
+                host,
+                slots,
+                slot_of,
+                who,
+                wtab_h,
+                stab_h,
                 wtab,
                 stab,
                 sh: [
@@ -299,6 +354,11 @@ impl DsparkGpu {
             prof: vec![],
             prof_n: 0,
             usage: vec![],
+            counts: g.alloc_zeroed(nl * ne * 4)?,
+            heat: vec![vec![0.0; ne]; nl],
+            since_swap: 0,
+            swaps: 0,
+            _zero: zero.context("no draft layers")?,
         };
         anyhow::ensure!(ds.targets.len() == 3, "DSpark reads 3 target layers, config has {:?}", ds.targets);
         eprintln!("dspark: main head {:?} {}x{} (q8r {}, q6 {})", gm.head.ty, gm.head.rows, gm.head.cols, gm.head.q8r, gm.head.q6.is_some());
@@ -563,7 +623,60 @@ impl DsparkGpu {
                 }
             }
         }
+        self.since_swap += 1;
+        if self.since_swap >= SWAP_EVERY {
+            self.since_swap = 0;
+            self.update_cache(gm)?;
+        }
         Ok((out[1..].to_vec(), conf))
+    }
+
+    /// Expert cache: fold the pick counters into decayed heat and bring in up to SWAP_MAX experts that are hotter than
+    /// the coldest resident ones (from the checkpoint mapping on the host; between drafts).
+    fn update_cache(&mut self, gm: &GpuModel) -> Result<()> {
+        let g = &gm.g;
+        let ne = self.ne;
+        let c: Vec<u32> = g.download(self.counts.ptr, self.layers.len() * ne)?;
+        g.memset(self.counts.ptr, self.layers.len() * ne * 4)?;
+        let mut budget = SWAP_MAX;
+        for (li, l) in self.layers.iter_mut().enumerate() {
+            let heat = &mut self.heat[li];
+            for e in 0..ne {
+                heat[e] = 0.8 * heat[e] + c[li * ne + e] as f64;
+            }
+            if l.slots.len() >= ne {
+                continue;
+            }
+            let mut want: Vec<usize> = (0..ne).filter(|&e| l.slot_of[e].is_none()).collect();
+            want.sort_by(|&a, &b| heat[b].total_cmp(&heat[a]));
+            for e in want {
+                if budget == 0 {
+                    break;
+                }
+                // the coldest resident
+                let (si, &victim) = l.who.iter().enumerate().min_by(|a, b| heat[*a.1].total_cmp(&heat[*b.1])).unwrap();
+                if heat[e] <= 1.25 * heat[victim] + 0.5 {
+                    break;
+                }
+                for j in 0..3 {
+                    let (m, s) = (&l.host[e][j], &l.slots[si][j]);
+                    g.htod_sync(s.buf.ptr, m.bytes())?;
+                    g.htod_sync(s.scale.as_ref().unwrap().ptr, m.scale_bytes())?;
+                    l.wtab_h[j][e] = s.buf.ptr;
+                    l.stab_h[j][e] = s.scale.as_ref().unwrap().ptr;
+                    l.wtab_h[j][victim] = self._zero[j].buf.ptr;
+                    l.stab_h[j][victim] = self._zero[j].scale.as_ref().unwrap().ptr;
+                    g.htod_sync(l.wtab[j].ptr, &l.wtab_h[j])?;
+                    g.htod_sync(l.stab[j].ptr, &l.stab_h[j])?;
+                }
+                l.slot_of[victim] = None;
+                l.slot_of[e] = Some(si);
+                l.who[si] = e;
+                self.swaps += 1;
+                budget -= 1;
+            }
+        }
+        Ok(())
     }
 
     /// x [bl][d] (normed) -> a [bl][d]: routed experts (per row and pick) then the shared expert, bf16
@@ -573,6 +686,8 @@ impl DsparkGpu {
         let (g, b) = (&gm.g, &self.b);
         gm.gemv_t(&l.gate_w, b.x.ptr, b.rl.ptr, bl)?;
         g.launch(gm.k["router_topk"], (bl as u32, 1, 1), 32, 0, &[Arg::P(b.rl.ptr), Arg::P(l.gate_bias.ptr), Arg::P(b.sel.ptr), Arg::P(b.wts.ptr), Arg::I(self.ne as i32), Arg::I(k as i32), Arg::F(c.route_scale), Arg::P(0)])?;
+        let li = self.layers.iter().position(|x| std::ptr::eq(x, l)).unwrap_or(0);
+        g.launch(gm.k["dsp_count"], (1, 1, 1), 64, 0, &[Arg::P(b.sel.ptr), Arg::I((bl * k) as i32), Arg::P(self.counts.ptr + (li * self.ne * 4) as u64), Arg::I(self.ne as i32)])?;
         // shared expert for every row (into sh_out) while the picks come back
         gm.gemv_t(&l.sh[0], b.x.ptr, b.eg.ptr, bl)?;
         gm.gemv_t(&l.sh[1], b.x.ptr, b.eu.ptr, bl)?;

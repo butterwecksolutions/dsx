@@ -534,6 +534,7 @@ fn main() -> Result<()> {
                     if !r.is_empty() {
                         println!("[{pname}] draft sections ms: {r}");
                         println!("[{pname}] draft expert picks: {}", dg.usage_report());
+                        println!("[{pname}] draft expert cache: {} swaps so far", dg.swaps);
                     }
                 }
                 let rows: Vec<String> = scored

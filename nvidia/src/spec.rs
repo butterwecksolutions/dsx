@@ -94,7 +94,8 @@ impl SpecControl {
             return best;
         }
         self.since_probe += 1;
-        let confident = self.since_probe >= 4 && self.conf >= self.conf_paid;
+        // early, but still within the back-off: at most every quarter gap
+        let confident = self.since_probe >= (self.probe_gap / 4).max(4) && self.conf >= self.conf_paid;
         if self.since_probe >= self.probe_gap || confident {
             self.since_probe = 0;
             self.probing = true;
@@ -131,13 +132,15 @@ impl SpecControl {
 }
 
 /// The top probability of a logit vector (softmax max), for SpecControl::note_conf
+/// (every token: only logits within 16 of the max are exponentiated, the rest weigh < 1e-7 each)
 pub fn top_prob(logits: &[f32]) -> f64 {
     let mx = logits.iter().cloned().filter(|v| v.is_finite()).fold(f32::NEG_INFINITY, f32::max);
     if !mx.is_finite() {
         return 0.0;
     }
-    let sum: f64 = logits.iter().filter(|v| v.is_finite()).map(|&v| ((v - mx) as f64).exp()).sum();
-    1.0 / sum.max(1.0)
+    let th = mx - 16.0;
+    let sum: f32 = logits.iter().filter(|&&v| v > th).map(|&v| (v - mx).exp()).sum();
+    1.0 / (sum as f64).max(1.0)
 }
 
 #[cfg(test)]
@@ -174,7 +177,7 @@ mod tests {
         c.note_conf(1.0);
         c.note_conf(1.0);
         c.note_conf(1.0);
-        assert!((1..=6).any(|_| c.choose(5) > 0));
+        assert!((1..=8).any(|_| c.choose(5) > 0));
         assert!((super::top_prob(&[0.0, 0.0]) - 0.5).abs() < 1e-9);
     }
 }
