@@ -22,9 +22,55 @@ const KERNEL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dsx.fatbin
 /// the same kernels compiled with --fmad=false (separate multiply and add)
 const KERNEL_IMAGE_NOFMA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dsx_nofma.fatbin"));
 
-/// DSX_NOFMA=1,2: GPU ordinals that load the kernels without fused multiply-add
+/// GPU ordinals that load the kernels without fused multiply-add: DSX_NOFMA=1,2 by hand, else what `pick_kernels`
+/// measured (a GPU that throttles FFMA, like a CMP 170HX, runs the decode GEMVs faster without it)
+static NOFMA: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+
 fn nofma_for(ordinal: i32) -> bool {
-    std::env::var("DSX_NOFMA").is_ok_and(|v| v.split(',').any(|s| s.trim().parse::<i32>().ok() == Some(ordinal)))
+    match std::env::var("DSX_NOFMA") {
+        Ok(v) => v.split(',').any(|s| s.trim().parse::<i32>().ok() == Some(ordinal)),
+        Err(_) => NOFMA.get().is_some_and(|l| l.contains(&ordinal)),
+    }
+}
+
+/// Per GPU, time an attention-sized Q8 decode GEMV with both kernel images and keep the faster one (without FMA only when
+/// it is at least 3 % faster). Once per process, before the model's contexts load their kernels; DSX_NOFMA overrides.
+pub fn pick_kernels(ordinals: &[i32]) -> Result<()> {
+    if NOFMA.get().is_some() || std::env::var_os("DSX_NOFMA").is_some() || KERNEL_IMAGE_NOFMA.is_empty() {
+        return Ok(());
+    }
+    let mut pick = vec![];
+    for &o in ordinals {
+        let (rows, cols) = (8192usize, 5120usize);
+        let mut us = [0.0f64; 2];
+        for (i, nofma) in [false, true].into_iter().enumerate() {
+            let g = Gpu::new_with(o, nofma)?;
+            let w = g.alloc(rows * cols)?;
+            g.memset(w.ptr, rows * cols)?;
+            let s = g.upload(&vec![0x1c00u16; rows * cols / 32])?;
+            let x = g.alloc_zeroed(cols * 4)?;
+            let y = g.alloc_zeroed(rows * 4)?;
+            let k = g.kernel("gemv_q8r")?;
+            let mut run = |m: usize| -> Result<f64> {
+                g.sync()?;
+                let t0 = std::time::Instant::now();
+                for _ in 0..m {
+                    g.launch(k, ((rows as u32).div_ceil(4), 1, 1), 128, 0, &[Arg::P(w.ptr), Arg::P(x.ptr), Arg::P(y.ptr), Arg::I(rows as i32), Arg::I(cols as i32), Arg::I(1), Arg::I(cols as i32), Arg::I(rows as i32), Arg::P(s.ptr)])?;
+                }
+                g.sync()?;
+                Ok(t0.elapsed().as_secs_f64() * 1e6 / m as f64)
+            };
+            run(10)?;
+            us[i] = run(60)?.min(run(60)?);
+        }
+        let faster = us[1] < 0.97 * us[0];
+        eprintln!("GPU{o}: decode GEMV {:.1} us with FMA, {:.1} us without: kernels {}", us[0], us[1], if faster { "without FMA" } else { "as built" });
+        if faster {
+            pick.push(o);
+        }
+    }
+    let _ = NOFMA.set(pick);
+    Ok(())
 }
 
 /// Device memory, freed on drop.

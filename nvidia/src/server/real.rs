@@ -123,6 +123,17 @@ pub fn real_engine(args: &RealEngineArgs) -> Result<Box<dyn Engine>> {
         }
         None => None,
     };
+    // learned on this machine: DSpark that has not paid for UNPAID_SKIP_TOKENS stays unloaded for SKIP_SECS (its memory
+    // goes to experts), then measures again
+    let learned = dspark_dir.and_then(|d| std::fs::read(spec_state_path(d)).ok()).and_then(|b| serde_json::from_slice::<crate::spec::Learned>(&b).ok());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let dspark_need = match (&learned, dspark_need) {
+        (Some(l), Some(_)) if l.skip_until > now => {
+            tracing::info!(event = "dspark", days_left = (l.skip_until - now) as f64 / 86400.0, "speculative decoding skipped: it did not pay on this machine; its memory goes to experts until it measures again");
+            None
+        }
+        (_, n) => n,
+    };
     let need_gb = dspark_need.map_or(0.0, |b| b as f64 / 1e9);
     let pl = Placement { gpu0_gb: args.gpu0_gb, aux_gb: args.gpu1_gb, arena_gb: args.arena_gb, prefill_chunk: args.chunk, rank: args.rank.clone() };
     let vision = args.vision.as_deref().map(VisionWeights::load).transpose()?;
@@ -132,7 +143,14 @@ pub fn real_engine(args: &RealEngineArgs) -> Result<Box<dyn Engine>> {
             Ok(dg) => {
                 gm.capture_hidden(&dg.targets.clone())?;
                 tracing::info!(event = "dspark", gpu = dg.ordinal, gb = dg.bytes as f64 / 1e9, reserved_gb = need_gb, block = dg.block, "speculative decoding on (per token by measured gain)");
-                let ctl = crate::spec::SpecControl::new(dg.block);
+                let mut ctl = crate::spec::SpecControl::new(dg.block);
+                if let Some(l) = &learned {
+                    ctl.resume(l);
+                    // back from a skip: measure afresh
+                    if l.skip_until > 0 {
+                        ctl.since_paid = 0;
+                    }
+                }
                 Some((dg, ctl))
             }
             Err(e) => {
@@ -987,6 +1005,27 @@ fn multi_request(
     Ok((fin, stats))
 }
 
+/// DSX_STATE_DIR (or the checkpoint directory) / dspark-control.json
+fn spec_state_path(dir: &std::path::Path) -> std::path::PathBuf {
+    std::env::var_os("DSX_STATE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| dir.to_path_buf()).join("dspark-control.json")
+}
+
+/// Keep what the controller learned; after UNPAID_SKIP_TOKENS without a paying pass, the next start skips DSpark
+fn save_spec_state(dg: &crate::gpumodel::DsparkGpu, ctl: &crate::spec::SpecControl) {
+    let mut l = ctl.learned();
+    if l.since_paid >= crate::spec::UNPAID_SKIP_TOKENS {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        l.skip_until = now + crate::spec::SKIP_SECS;
+    }
+    let p = spec_state_path(&dg.dir);
+    let tmp = p.with_extension("json.tmp");
+    if let Ok(b) = serde_json::to_vec(&l) {
+        if std::fs::write(&tmp, b).and_then(|_| std::fs::rename(&tmp, &p)).is_err() {
+            tracing::debug!(path = %p.display(), "dspark-control.json not written");
+        }
+    }
+}
+
 /// Decode up to `max_new` tokens from `logits`, speculatively with DSpark when `spec` is given and `spec_ok` (per token
 /// by SpecControl: 0 drafts = a plain step). `push(token, pos)` is called for every token that entered the model state.
 /// Returns how it finished, the raw logits after the last token, and how many tokens went through the model.
@@ -1134,5 +1173,8 @@ fn decode_tokens(
                 break;
             }
         }
+    if let Some((dg, ctl)) = spec.as_deref() {
+        save_spec_state(dg, ctl);
+    }
     Ok((fin, raw, steps))
 }

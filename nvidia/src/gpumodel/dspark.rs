@@ -131,8 +131,7 @@ struct Side {
     attn_part: Buf,
     freqs0: Buf,
     head: DMat,
-    /// on the main GPU: [3][d] hc-means of the captured rows, and the 1/hc mixes that make them
-    mh_main: Buf,
+    /// on the main GPU: the 1/hc mixes that make the hc-means of the captured rows
     mhmix_main: Buf,
     /// free memory before the stack's first byte on this GPU
     free0: usize,
@@ -162,7 +161,6 @@ impl Side {
             attn_part: g.alloc_zeroed(8 * ATTN_SPLITS * c.n_heads * (c.head_dim + 2) * 4)?,
             freqs0: f32buf(&g, &m.ropes.0.freqs)?,
             head,
-            mh_main: gm.g.alloc_zeroed(MH_ROWS * 3 * c.dim * 4)?,
             mhmix_main: gm.g.upload(&mhmix)?,
             free0,
             g,
@@ -260,10 +258,6 @@ impl<'a> Dev<'a> {
         self.launch(kname, ((n as u32).div_ceil(per_block), 1, 1), 128, &[Arg::P(wp), Arg::P(x), Arg::P(y), Arg::I(n as i32), Arg::I(w.cols as i32), Arg::I(t as i32), Arg::I(ldx as i32), Arg::I(ldy as i32), Arg::P(sp)])
     }
 
-    fn rmsnorm(&self, x: u64, w: &Buf, out: u64, n: usize, round: bool) -> Result<()> {
-        self.rms_rows(x, w, out, n, 1, round)
-    }
-
     fn rms_rows(&self, x: u64, w: &Buf, out: u64, n: usize, rows: usize, round: bool) -> Result<()> {
         self.launch("rmsnorm", (rows as u32, 1, 1), 1024, &[Arg::P(x), Arg::P(w.ptr), Arg::P(out), Arg::I(n as i32), Arg::I(n as i32), Arg::I(n as i32), Arg::F(self.c.eps), Arg::I(round as i32)])
     }
@@ -336,6 +330,8 @@ pub struct DsparkGpu {
     side: Option<Side>,
     /// the GPU ordinal it runs on
     pub ordinal: i32,
+    /// the checkpoint directory it came from
+    pub dir: std::path::PathBuf,
 }
 
 fn up(g: &Gpu, w: &Mat) -> Result<DMat> {
@@ -543,8 +539,8 @@ impl DsparkGpu {
             bias: fz(vocab.max(markov_head.rows))?,
             mh: fz(MH_ROWS * 3 * d)?,
             mhmix: g.upload(&mhmix)?,
-            mx: fz(d)?,
-            kvo: fz(hd)?,
+            mx: fz(crate::handoff::MAXT * d)?,
+            kvo: fz(crate::handoff::MAXT * hd)?,
         };
         let counts = g.alloc_zeroed(nl * ne * 4)?;
         let hist = gm.g.alloc_zeroed(c.window * 3 * c.dim * 4)?;
@@ -588,6 +584,7 @@ impl DsparkGpu {
             _zero: zero.context("no draft layers")?,
             side,
             ordinal,
+            dir: dir.to_path_buf(),
         };
         anyhow::ensure!(ds.targets.len() == 3, "DSpark reads 3 target layers, config has {:?}", ds.targets);
         eprintln!("dspark: GPU{ordinal}, main head {:?} {}x{} (q8r {}, q6 {})", gm.head.ty, gm.head.rows, gm.head.cols, gm.head.q8r, gm.head.q6.is_some());
@@ -686,34 +683,47 @@ impl DsparkGpu {
         for chunk in positions.chunks(MH_ROWS) {
             let dv = dev_of(&self.side, gm);
             let b = &self.b;
-            // per position the input row: hist on the main GPU, or its copy on the draft GPU
-            let src: Vec<u64> = if self.side.is_some() {
-                let mut v: Vec<f32> = Vec::with_capacity(chunk.len() * 3 * d);
-                // contiguous slot runs (the window wraps at most once per chunk)
+            // the chunk's rows contiguous in b.mh on the draft GPU: from hist over the host, or on the main GPU a device copy
+            {
+                let mut v: Vec<f32> = Vec::new();
                 let mut i = 0;
                 while i < chunk.len() {
+                    // contiguous slot runs (the window wraps at most once per chunk)
                     let s0 = chunk[i] % w;
                     let mut n = 1;
                     while i + n < chunk.len() && chunk[i + n] % w == s0 + n {
                         n += 1;
                     }
-                    v.extend(gm.g.download::<f32>(self.hist.ptr + (s0 * 3 * d * 4) as u64, n * 3 * d)?);
+                    let src = self.hist.ptr + (s0 * 3 * d * 4) as u64;
+                    if self.side.is_some() {
+                        v.extend(gm.g.download::<f32>(src, n * 3 * d)?);
+                    } else {
+                        gm.g.dtod(b.mh.ptr + (i * 3 * d * 4) as u64, src, n * 3 * d * 4)?;
+                    }
                     i += n;
                 }
-                dv.g.htod_sync(b.mh.ptr, &v)?;
-                (0..chunk.len()).map(|j| b.mh.ptr + (j * 3 * d * 4) as u64).collect()
-            } else {
-                chunk.iter().map(|&p| self.hist.ptr + ((p % w) * 3 * d * 4) as u64).collect()
-            };
-            for (&p, &mhj) in chunk.iter().zip(&src) {
-                dv.gemv(&self.main_proj, mhj, b.mx.ptr)?;
-                dv.rmsnorm(b.mx.ptr, &self.main_norm, b.mx.ptr, d, true)?;
+                if self.side.is_some() {
+                    dv.g.htod_sync(b.mh.ptr, &v)?;
+                }
+            }
+            // up to MAXT rows per pass: each weight is read once per batch, not once per row
+            let mt = crate::handoff::MAXT;
+            for s in (0..chunk.len()).step_by(mt) {
+                let t = mt.min(chunk.len() - s);
+                let x = b.mh.ptr + (s * 3 * d * 4) as u64;
+                dv.gemv_t(&self.main_proj, x, b.mx.ptr, t)?;
+                dv.rms_rows(b.mx.ptr, &self.main_norm, b.mx.ptr, d, t, true)?;
                 if dbg() {
-                    eprintln!("dspark-dbg gpu observe p{p}: main_hidden {:.4} mx {:.4}", dn(dv.g, mhj, 0, 3 * d), dn(dv.g, b.mx.ptr, 0, d));
+                    for r in 0..t {
+                        eprintln!("dspark-dbg gpu observe p{}: main_hidden {:.4} mx {:.4}", chunk[s + r], dn(dv.g, x + (r * 3 * d * 4) as u64, 0, 3 * d), dn(dv.g, b.mx.ptr + (r * d * 4) as u64, 0, d));
+                    }
                 }
                 for l in &self.layers {
-                    dv.gemv(&l.kv, b.mx.ptr, b.kvo.ptr)?;
-                    dv.g.launch(dv.k["kv_norm_rope_store"], (1, 1, 1), 1024, 0, &[Arg::P(b.kvo.ptr), Arg::P(l.kv_norm.ptr), Arg::I(hd as i32), Arg::F(c.eps), Arg::P(dv.freqs0), Arg::I(c.rope_dim as i32), Arg::I(p as i32), Arg::P(l.ring.ptr + ((p % w) * hd * 2) as u64)])?;
+                    dv.gemv_t(&l.kv, b.mx.ptr, b.kvo.ptr, t)?;
+                    for r in 0..t {
+                        let p = chunk[s + r];
+                        dv.g.launch(dv.k["kv_norm_rope_store"], (1, 1, 1), 1024, 0, &[Arg::P(b.kvo.ptr + (r * hd * 4) as u64), Arg::P(l.kv_norm.ptr), Arg::I(hd as i32), Arg::F(c.eps), Arg::P(dv.freqs0), Arg::I(c.rope_dim as i32), Arg::I(p as i32), Arg::P(l.ring.ptr + ((p % w) * hd * 2) as u64)])?;
+                    }
                 }
             }
         }

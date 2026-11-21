@@ -46,12 +46,33 @@ pub struct SpecControl {
     /// written off on its prior alone; every EXPLORE_EVERY passes the next longer draft is tried when close
     measured: Vec<bool>,
     passes: usize,
+    /// tokens decoded since a pass last paid (learned across requests and restarts, see `Learned`)
+    pub since_paid: u64,
 }
+
+/// What the controller has learned, kept across restarts (DSX_STATE_DIR/dspark-control.json): like the expert tiering,
+/// DSpark decides from measurements on this machine and this workload whether it is worth its memory.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Learned {
+    pub probe_gap: usize,
+    pub conf_paid: f64,
+    pub hit: Vec<f64>,
+    pub since_paid: u64,
+    /// unix seconds until which the server leaves DSpark unloaded (its memory goes to experts)
+    #[serde(default)]
+    pub skip_until: u64,
+}
+
+/// decoded tokens without one paying pass after which DSpark gives its memory back at the next start
+pub const UNPAID_SKIP_TOKENS: u64 = 30_000;
+/// how long it then stays unloaded before it measures again
+pub const SKIP_SECS: u64 = 7 * 24 * 3600;
 
 pub const EXPLORE_EVERY: usize = 24;
 
 pub const PROBE_MIN: usize = 16;
-pub const PROBE_MAX: usize = 256;
+/// a probe that does not pay doubles the gap up to this (prose: about one probe per 2k tokens, ~1 % cost)
+pub const PROBE_MAX: usize = 2048;
 
 impl SpecControl {
     pub fn new(max: usize) -> SpecControl {
@@ -69,7 +90,26 @@ impl SpecControl {
             conf_paid: 1.0,
             measured: vec![false; max + 2],
             passes: 0,
+            since_paid: 0,
         }
+    }
+
+    pub fn learned(&self) -> Learned {
+        Learned { probe_gap: self.probe_gap, conf_paid: self.conf_paid, hit: self.hit.clone(), since_paid: self.since_paid, skip_until: 0 }
+    }
+
+    /// continue from what an earlier run learned (sizes that do not fit are ignored)
+    pub fn resume(&mut self, l: &Learned) {
+        if (PROBE_MIN..=PROBE_MAX).contains(&l.probe_gap) {
+            self.probe_gap = l.probe_gap;
+        }
+        if (0.0..=1.0).contains(&l.conf_paid) {
+            self.conf_paid = l.conf_paid;
+        }
+        if l.hit.len() == self.hit.len() && l.hit.iter().all(|h| (0.0..=1.0).contains(h)) {
+            self.hit = l.hit.clone();
+        }
+        self.since_paid = l.since_paid;
     }
 
     fn ema(x: &mut f64, v: f64, a: f64) {
@@ -135,6 +175,7 @@ impl SpecControl {
 
     pub fn note_step(&mut self, ms: f64) {
         Self::ema(&mut self.step_ms, ms, 0.1);
+        self.since_paid += 1;
     }
 
     /// the main model's top probability for the token just decided (any path)
@@ -159,7 +200,11 @@ impl SpecControl {
         if paid {
             Self::ema(&mut self.conf_paid, self.conf, 0.3);
             self.probe_gap = PROBE_MIN;
-        } else if self.probing {
+            self.since_paid = 0;
+        } else {
+            self.since_paid += (1 + j) as u64;
+        }
+        if !paid && self.probing {
             self.probe_gap = (self.probe_gap * 2).min(PROBE_MAX);
         }
         self.probing = false;
@@ -221,5 +266,34 @@ mod tests {
         c.note_pass(3, 3, 9.0, 50.0);
         c.note_pass(4, 4, 9.0, 60.0);
         assert!(c.verify_cost(6) < 80.0, "{}", c.verify_cost(6));
+    }
+
+    #[test]
+    fn learns_across_restarts_and_counts_unpaid_tokens() {
+        let mut c = super::SpecControl::new(5);
+        c.step_ms = 25.0;
+        for _ in 0..10 {
+            c.note_step(25.0);
+        }
+        // a probe that does not pay counts its tokens and backs off further than before (2048)
+        c.probing = true;
+        c.probe_gap = 1024;
+        c.note_pass(2, 0, 10.0, 58.0);
+        assert_eq!((c.since_paid, c.probe_gap), (11, 2048));
+        c.probing = true;
+        c.note_pass(2, 0, 10.0, 58.0);
+        assert_eq!(c.probe_gap, super::PROBE_MAX);
+        let l = c.learned();
+        let mut d = super::SpecControl::new(5);
+        d.resume(&serde_json::from_slice(&serde_json::to_vec(&l).unwrap()).unwrap());
+        assert_eq!((d.probe_gap, d.since_paid), (2048, 12));
+        // a paying pass resets both
+        d.step_ms = 25.0;
+        d.note_pass(3, 3, 9.0, 50.0);
+        assert_eq!((d.probe_gap, d.since_paid), (super::PROBE_MIN, 0));
+        // sizes that do not fit are ignored
+        let mut e = super::SpecControl::new(5);
+        e.resume(&super::Learned { probe_gap: 9999, conf_paid: 2.0, hit: vec![0.5; 3], since_paid: 7, skip_until: 0 });
+        assert_eq!((e.probe_gap, e.conf_paid, e.hit.len(), e.since_paid), (super::PROBE_MIN, 1.0, 5, 7));
     }
 }

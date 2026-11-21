@@ -288,7 +288,9 @@ pub struct GpuInfo {
 /// Every visible GPU (DSX_GPUS="0,2" limits them): memory and measured host -> device bandwidth.
 pub fn probe_gpus() -> Result<Vec<GpuInfo>> {
     let only: Option<Vec<i32>> = std::env::var("DSX_GPUS").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
-    let gs: Vec<Gpu> = (0..Gpu::count()?).filter(|i| only.as_ref().is_none_or(|o| o.contains(i))).map(Gpu::new).collect::<Result<_>>()?;
+    let ords: Vec<i32> = (0..Gpu::count()?).filter(|i| only.as_ref().is_none_or(|o| o.contains(i))).collect();
+    crate::gpu::pick_kernels(&ords)?;
+    let gs: Vec<Gpu> = ords.iter().map(|&o| Gpu::new(o)).collect::<Result<_>>()?;
     let Some(g0) = gs.first() else { bail!("no CUDA devices") };
     g0.bind();
     let stage = crate::gpu::HostBuf::new(64 << 20)?;
