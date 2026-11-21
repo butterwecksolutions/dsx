@@ -296,8 +296,14 @@ pub fn probe_gpus() -> Result<Vec<GpuInfo>> {
 }
 
 /// The main GPU (dense weights, KV, prefill, the expert cache that swaps): the best host link, within 15%, then
-/// the most memory.
+/// the most memory. DSX_MAIN_GPU=<ordinal> picks one (for comparisons: a GPU with faster memory but a slower host link).
 pub fn pick_main(gpus: &[GpuInfo]) -> i32 {
+    if let Some(o) = std::env::var("DSX_MAIN_GPU").ok().and_then(|v| v.trim().parse::<i32>().ok()) {
+        if gpus.iter().any(|g| g.ordinal == o) {
+            return o;
+        }
+        eprintln!("DSX_MAIN_GPU={o}: no such GPU, picking by host link");
+    }
     let best = gpus.iter().map(|g| g.h2d_gbs).fold(0.0, f64::max);
     gpus.iter().filter(|g| g.h2d_gbs >= 0.85 * best).max_by_key(|g| g.total).map_or(0, |g| g.ordinal)
 }
