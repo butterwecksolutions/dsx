@@ -50,6 +50,14 @@ enum Cmd {
         #[arg(long, default_value = "https://huggingface.co")]
         hub: String,
     },
+    /// Weight-streaming speed of each GPU: the decode GEMV kernels (Q8 repacked, one and five tokens, attention- and
+    /// head-sized) and a device copy, in GB/s of weights read; with and without fused multiply-add. Needs no model;
+    /// allocates ~1.5 GB per GPU. Prints one `gemv-json` line.
+    #[cfg(feature = "cuda")]
+    BenchGemv {
+        #[arg(long, default_value_t = 50)]
+        iters: usize,
+    },
     /// DSpark acceptance on the GPU engine (a GGUF plus the checkpoint's mtp.* shards): greedy decode on the GPUs, a
     /// draft from the CPU reference after every token, scored against the tokens the model actually produces next.
     /// Prints one `dspark-json` line (per draft: accepted count and confidences) for offline cost models.
@@ -423,6 +431,7 @@ fn main() -> Result<()> {
         }
         Cmd::FetchMtp { dir, repo, hub } => fetch_mtp(&dir, &repo, &hub)?,
         #[cfg(feature = "cuda")]
+        Cmd::BenchGemv { iters } => bench_gemv(iters)?,
         Cmd::SpecDraft { model, engram, mtp, ids, n, ctx, gpu0_gb, gpu1_gb, arena_gb, rank, gpu, check_cpu, spec, chunk } => {
             // one or more prompts (';' separated, each comma/whitespace ids or @file), measured in one load
             let prompts: Vec<(String, Vec<u32>)> = ids
@@ -1112,5 +1121,66 @@ fn main() -> Result<()> {
             println!("{} tokens in {el:.1} s ({:.2} tok/s); CPU experts {:.1} s; routed evals main GPU/aux GPUs/CPU {:?}", toks.len(), toks.len() as f64 / el, gm.t_experts, gm.n_routed);
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn bench_gemv(iters: usize) -> Result<()> {
+    use dsx::gpu::{Arg, Gpu};
+    let n = Gpu::count()?;
+    let mut out = vec![];
+    // (label, rows, cols, tokens): attention output / q-sized, a large dense layer, the vocabulary head
+    let shapes: [(&str, usize, usize, usize); 5] = [("attn 5120x8192", 5120, 8192, 1), ("attn 8192x5120", 8192, 5120, 1), ("dense 16384x5120", 16384, 5120, 1), ("head 129280x5120", 129280, 5120, 1), ("head t5", 129280, 5120, 5)];
+    for ord in 0..n {
+        for nofma in [false, true] {
+            let g = Gpu::new_with(ord, nofma)?;
+            let mut res = serde_json::Map::new();
+            res.insert("gpu".into(), ord.into());
+            res.insert("name".into(), g.name.clone().into());
+            res.insert("nofma".into(), nofma.into());
+            for &(label, rows, cols, t) in &shapes {
+                let w = g.alloc(rows * cols)?;
+                g.memset(w.ptr, rows * cols)?;
+                // f16 scales 2^-8 (bits 0x1c00), activations 0
+                let sc: Vec<u16> = vec![0x1c00; rows * cols / 32];
+                let s = g.upload(&sc)?;
+                let x = g.alloc_zeroed(t * cols * 4)?;
+                let y = g.alloc_zeroed(t * rows * 4)?;
+                let (kn, per) = if t > 1 { ("gemv_q8r4", 16u32) } else { ("gemv_q8r", 4u32) };
+                let k = g.kernel(kn)?;
+                let run = |m: usize| -> Result<f64> {
+                    g.sync()?;
+                    let t0 = Instant::now();
+                    for _ in 0..m {
+                        g.launch(k, ((rows as u32).div_ceil(per), 1, 1), 128, 0, &[Arg::P(w.ptr), Arg::P(x.ptr), Arg::P(y.ptr), Arg::I(rows as i32), Arg::I(cols as i32), Arg::I(t as i32), Arg::I(cols as i32), Arg::I(rows as i32), Arg::P(s.ptr)])?;
+                    }
+                    g.sync()?;
+                    Ok(t0.elapsed().as_secs_f64() / m as f64)
+                };
+                run(5)?;
+                let sec = run(iters)?;
+                let gbs = (rows * cols + rows * cols / 16) as f64 / sec / 1e9;
+                eprintln!("GPU{ord} {}{}: {label}: {:.1} us, {gbs:.0} GB/s", g.name, if nofma { " (no FMA)" } else { "" }, sec * 1e6);
+                res.insert(label.into(), serde_json::json!({"us": sec * 1e6, "gbs": gbs}));
+            }
+            if !nofma {
+                let bytes = 1usize << 30;
+                let a = g.alloc(bytes)?;
+                let b = g.alloc(bytes)?;
+                g.dtod(b.ptr, a.ptr, bytes)?;
+                g.sync()?;
+                let t0 = Instant::now();
+                for _ in 0..10 {
+                    g.dtod(b.ptr, a.ptr, bytes)?;
+                }
+                g.sync()?;
+                let gbs = 2.0 * bytes as f64 * 10.0 / t0.elapsed().as_secs_f64() / 1e9;
+                eprintln!("GPU{ord} {}: device copy {gbs:.0} GB/s (read + write)", g.name);
+                res.insert("copy_gbs".into(), gbs.into());
+            }
+            out.push(serde_json::Value::Object(res));
+        }
+    }
+    println!("gemv-json {}", serde_json::Value::Array(out));
     Ok(())
 }

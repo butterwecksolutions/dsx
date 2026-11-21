@@ -19,6 +19,13 @@ pub fn check(r: cu::CUresult, what: &str) -> Result<()> {
 }
 
 const KERNEL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dsx.fatbin"));
+/// the same kernels compiled with --fmad=false (separate multiply and add)
+const KERNEL_IMAGE_NOFMA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dsx_nofma.fatbin"));
+
+/// DSX_NOFMA=1,2: GPU ordinals that load the kernels without fused multiply-add
+fn nofma_for(ordinal: i32) -> bool {
+    std::env::var("DSX_NOFMA").is_ok_and(|v| v.split(',').any(|s| s.trim().parse::<i32>().ok() == Some(ordinal)))
+}
 
 /// Device memory, freed on drop.
 pub struct Buf {
@@ -89,7 +96,13 @@ unsafe impl Send for Gpu {}
 
 impl Gpu {
     pub fn new(ordinal: i32) -> Result<Gpu> {
-        if KERNEL_IMAGE.is_empty() {
+        Self::new_with(ordinal, nofma_for(ordinal))
+    }
+
+    /// `nofma`: load the kernels compiled without fused multiply-add
+    pub fn new_with(ordinal: i32, nofma: bool) -> Result<Gpu> {
+        let kimage: &[u8] = if nofma { KERNEL_IMAGE_NOFMA } else { KERNEL_IMAGE };
+        if kimage.is_empty() {
             bail!("built without the `cuda` feature: no kernels");
         }
         unsafe {
@@ -118,8 +131,8 @@ impl Gpu {
             let mut par = std::ptr::null_mut();
             check(cu::cuStreamCreate(&mut par, cu::CUstream_flags::CU_STREAM_NON_BLOCKING as u32), "cuStreamCreate")?;
             let image = {
-                let mut v = vec![0u64; KERNEL_IMAGE.len().div_ceil(8)];
-                std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, KERNEL_IMAGE.len()).copy_from_slice(KERNEL_IMAGE);
+                let mut v = vec![0u64; kimage.len().div_ceil(8)];
+                std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, kimage.len()).copy_from_slice(kimage);
                 v
             };
             let mut module = std::ptr::null_mut();

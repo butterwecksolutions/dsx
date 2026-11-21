@@ -314,6 +314,9 @@ pub struct DsparkGpu {
     ring_saved: Vec<Buf>,
     /// (first, last) position of the contiguous run the rings hold; None = nothing usable
     seen: Option<(usize, usize)>,
+    /// on the main GPU: [window][3][dim] hc-means by position % window, and the contiguous run of positions in it
+    hist: Buf,
+    noted: Option<(usize, usize)>,
     seen_saved: Option<(usize, usize)>,
     prof_on: bool,
     prof: Vec<(&'static str, f64)>,
@@ -544,6 +547,7 @@ impl DsparkGpu {
             kvo: fz(hd)?,
         };
         let counts = g.alloc_zeroed(nl * ne * 4)?;
+        let hist = gm.g.alloc_zeroed(c.window * 3 * c.dim * 4)?;
         let main_proj = up(g, &mat("mtp.0.main_proj.weight")?)?;
         let main_norm = f32buf(g, &v("mtp.0.main_norm.weight")?)?;
         let norm = f32buf(g, &v(&format!("mtp.{last}.norm.weight"))?)?;
@@ -567,6 +571,8 @@ impl DsparkGpu {
             bytes: 0,
             ring_saved: vec![],
             seen: None,
+            hist,
+            noted: None,
             seen_saved: None,
             prof_on: std::env::var_os("DSX_DSPARK_PROF").is_some(),
             prof: vec![],
@@ -614,6 +620,7 @@ impl DsparkGpu {
 
     pub fn invalidate(&mut self) {
         self.seen = None;
+        self.noted = None;
     }
 
     /// Positions the rings hold for the main model now at `pos`: the newest window of a contiguous run of observes.
@@ -622,53 +629,98 @@ impl DsparkGpu {
         (hi == pos).then(|| lo.max((pos + 1).saturating_sub(w)))
     }
 
-    /// items (position, row): the main GPU reduces each captured row to its hc-means (the draft's main_hidden), in
-    /// batches of MH_ROWS; on another draft GPU they cross over the host (3 x dim floats per row), then the draft GPU
-    /// projects each into every layer's window ring.
+    /// items (position, row): the main GPU reduces each captured row to its hc-means (the draft's main_hidden) into
+    /// `hist`, a window of them by position (no synchronization, a few tiny kernels). The draft GPU projects them into
+    /// its rings only when a draft needs them (`catch_up`): plain decoding pays almost nothing for DSpark.
     fn observe_rows(&mut self, gm: &GpuModel, base: u64, rows_per_layer: usize, items: &[(usize, usize)]) -> Result<()> {
         let _rb = Rebind(&gm.g);
         let c = &gm.m.cfg;
-        let (d, hd, w) = (c.dim, c.head_dim, c.window);
+        let (d, w) = (c.dim, c.window);
         anyhow::ensure!(gm.hid_layers == self.targets, "captured layers {:?}, DSpark reads {:?}", gm.hid_layers, self.targets);
         let row = c.hc * d * 4;
-        for chunk in items.chunks(MH_ROWS) {
-            let dv = dev_of(&self.side, gm);
-            let b = &self.b;
-            // main_hidden: per target layer the mean of the hc streams, bf16 (hc_pre with 1/4 weights rounds)
-            let (mh, mix) = match &self.side {
-                Some(s) => (s.mh_main.ptr, s.mhmix_main.ptr),
-                None => (b.mh.ptr, b.mhmix.ptr),
+        // main_hidden: per target layer the mean of the hc streams, bf16 (hc_pre with 1/4 weights rounds)
+        let mix = match &self.side {
+            Some(s) => s.mhmix_main.ptr,
+            None => self.b.mhmix.ptr,
+        };
+        for &(pos, t) in items {
+            for k in 0..3 {
+                gm.g.launch(gm.k["hc_pre"], (1, 1, 1), 256, 0, &[Arg::P(base + ((k * rows_per_layer + t) * row) as u64), Arg::P(mix), Arg::I(0), Arg::P(self.hist.ptr + (((pos % w) * 3 + k) * d * 4) as u64), Arg::I(d as i32)])?;
+            }
+            // contiguous with what `hist` holds, else a new run starts here
+            self.noted = match self.noted {
+                Some((lo, hi)) if pos == hi + 1 => Some((lo, pos)),
+                Some((lo, hi)) if pos <= hi && pos >= lo => Some((lo, pos)),
+                _ => Some((pos, pos)),
             };
-            for (j, &(_, t)) in chunk.iter().enumerate() {
-                for k in 0..3 {
-                    gm.g.launch(gm.k["hc_pre"], (1, 1, 1), 256, 0, &[Arg::P(base + ((k * rows_per_layer + t) * row) as u64), Arg::P(mix), Arg::I(0), Arg::P(mh + ((j * 3 + k) * d * 4) as u64), Arg::I(d as i32)])?;
+            // a rewritten position drops what the rings hold from there on
+            if let Some((lo, hi)) = self.seen {
+                if pos <= hi {
+                    self.seen = (pos > lo).then_some((lo, pos - 1));
                 }
             }
-            if self.side.is_some() {
-                let v: Vec<f32> = gm.g.download(mh, chunk.len() * 3 * d)?;
+        }
+        Ok(())
+    }
+
+    /// Project the noted positions the rings lack, up to `pos`, into every layer's window ring (on another draft GPU
+    /// they cross over the host first, 3 x dim floats per row, in batches of MH_ROWS).
+    pub fn catch_up(&mut self, gm: &GpuModel, pos: usize) -> Result<()> {
+        let _rb = Rebind(&gm.g);
+        let c = &gm.m.cfg;
+        let (d, hd, w) = (c.dim, c.head_dim, c.window);
+        let Some((nlo, nhi)) = self.noted else { return Ok(()) };
+        if nhi != pos {
+            return Ok(());
+        }
+        let need = nlo.max((pos + 1).saturating_sub(w));
+        let start = match self.seen {
+            Some((lo, hi)) if hi + 1 >= need && hi <= pos && lo <= need.max(lo) => hi + 1,
+            _ => need,
+        };
+        if start > pos {
+            return Ok(());
+        }
+        let continues = start != need || matches!(self.seen, Some((_, hi)) if hi + 1 == start);
+        let positions: Vec<usize> = (start..=pos).collect();
+        for chunk in positions.chunks(MH_ROWS) {
+            let dv = dev_of(&self.side, gm);
+            let b = &self.b;
+            // per position the input row: hist on the main GPU, or its copy on the draft GPU
+            let src: Vec<u64> = if self.side.is_some() {
+                let mut v: Vec<f32> = Vec::with_capacity(chunk.len() * 3 * d);
+                // contiguous slot runs (the window wraps at most once per chunk)
+                let mut i = 0;
+                while i < chunk.len() {
+                    let s0 = chunk[i] % w;
+                    let mut n = 1;
+                    while i + n < chunk.len() && chunk[i + n] % w == s0 + n {
+                        n += 1;
+                    }
+                    v.extend(gm.g.download::<f32>(self.hist.ptr + (s0 * 3 * d * 4) as u64, n * 3 * d)?);
+                    i += n;
+                }
                 dv.g.htod_sync(b.mh.ptr, &v)?;
-            }
-            for (j, &(pos, _)) in chunk.iter().enumerate() {
-                let mhj = b.mh.ptr + (j * 3 * d * 4) as u64;
+                (0..chunk.len()).map(|j| b.mh.ptr + (j * 3 * d * 4) as u64).collect()
+            } else {
+                chunk.iter().map(|&p| self.hist.ptr + ((p % w) * 3 * d * 4) as u64).collect()
+            };
+            for (&p, &mhj) in chunk.iter().zip(&src) {
                 dv.gemv(&self.main_proj, mhj, b.mx.ptr)?;
                 dv.rmsnorm(b.mx.ptr, &self.main_norm, b.mx.ptr, d, true)?;
                 if dbg() {
-                    eprintln!("dspark-dbg gpu observe p{pos}: main_hidden {:.4} mx {:.4}", dn(dv.g, mhj, 0, 3 * d), dn(dv.g, b.mx.ptr, 0, d));
+                    eprintln!("dspark-dbg gpu observe p{p}: main_hidden {:.4} mx {:.4}", dn(dv.g, mhj, 0, 3 * d), dn(dv.g, b.mx.ptr, 0, d));
                 }
                 for l in &self.layers {
                     dv.gemv(&l.kv, b.mx.ptr, b.kvo.ptr)?;
-                    dv.g.launch(dv.k["kv_norm_rope_store"], (1, 1, 1), 1024, 0, &[Arg::P(b.kvo.ptr), Arg::P(l.kv_norm.ptr), Arg::I(hd as i32), Arg::F(c.eps), Arg::P(dv.freqs0), Arg::I(c.rope_dim as i32), Arg::I(pos as i32), Arg::P(l.ring.ptr + ((pos % w) * hd * 2) as u64)])?;
+                    dv.g.launch(dv.k["kv_norm_rope_store"], (1, 1, 1), 1024, 0, &[Arg::P(b.kvo.ptr), Arg::P(l.kv_norm.ptr), Arg::I(hd as i32), Arg::F(c.eps), Arg::P(dv.freqs0), Arg::I(c.rope_dim as i32), Arg::I(p as i32), Arg::P(l.ring.ptr + ((p % w) * hd * 2) as u64)])?;
                 }
             }
-            // contiguous with what the rings hold, else a new run starts here
-            for &(pos, _) in chunk {
-                self.seen = match self.seen {
-                    Some((lo, hi)) if pos == hi + 1 => Some((lo, pos)),
-                    Some((lo, hi)) if pos <= hi && pos >= lo => Some((lo, pos)),
-                    _ => Some((pos, pos)),
-                };
-            }
         }
+        self.seen = match self.seen {
+            Some((lo, _)) if continues => Some((lo, pos)),
+            _ => Some((start, pos)),
+        };
         Ok(())
     }
 
@@ -679,6 +731,9 @@ impl DsparkGpu {
     /// Copy the window rings aside / back (with GpuModel::snapshot / restore)
     pub fn save_rings(&mut self, gm: &GpuModel) -> Result<()> {
         let _rb = Rebind(&gm.g);
+        if let Some((_, hi)) = self.noted {
+            self.catch_up(gm, hi)?;
+        }
         let n = gm.m.cfg.window * gm.m.cfg.head_dim * 2;
         if self.ring_saved.is_empty() {
             for _ in &self.layers {
@@ -695,6 +750,7 @@ impl DsparkGpu {
     pub fn restore_rings(&mut self, gm: &GpuModel) -> Result<()> {
         let _rb = Rebind(&gm.g);
         self.seen = self.seen_saved;
+        self.noted = self.seen;
         let n = gm.m.cfg.window * gm.m.cfg.head_dim * 2;
         for (l, s) in self.layers.iter().zip(&self.ring_saved) {
             self.side.as_ref().map_or(&gm.g, |s| &s.g).dtod(l.ring.ptr, s.ptr, n)?;
@@ -733,6 +789,7 @@ impl DsparkGpu {
     /// `next`. Returns (drafts, confidence): drafts[i] is the guess for position pos + 2 + i.
     pub fn draft(&mut self, gm: &GpuModel, pos: usize, next: u32) -> Result<(Vec<u32>, Vec<f32>)> {
         let _rb = Rebind(&gm.g);
+        self.catch_up(gm, pos)?;
         let m = gm.m;
         let c = &m.cfg;
         let (d, hc, hd, nh, w, bl) = (c.dim, c.hc, c.head_dim, c.n_heads, c.window, self.block);

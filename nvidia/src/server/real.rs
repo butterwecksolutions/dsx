@@ -1047,6 +1047,11 @@ fn decode_tokens(
             let drafted = match (want, spec.as_deref_mut()) {
                 (0, _) | (_, None) => None,
                 (_, Some((dg, _))) => {
+                    // the rings' backlog since the last draft (after a plain stretch up to a window of rows) is not
+                    // per-draft cost: outside the draft timing
+                    if let Err(e) = dg.catch_up(&*gm, gm.pos - 1) {
+                        tracing::debug!(error = %e, "draft catch-up");
+                    }
                     let td0 = Instant::now();
                     match dg.draft(&*gm, gm.pos - 1, tok) {
                         Ok((d, _)) => Some((d, td0.elapsed().as_secs_f64() * 1e3)),
