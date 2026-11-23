@@ -169,6 +169,15 @@ enum Cmd {
         /// score only predictions of positions >= FROM in each sequence (llama-perplexity scores the second half)
         #[arg(long, default_value_t = 0)]
         from: usize,
+        /// write the teacher files into EVAL from this model (top-`topk` log-probs) instead of reading them: a later
+        /// run with another setting (e.g. DSX_DENSE_Q6) then measures its KL against this one
+        #[arg(long)]
+        teacher_out: bool,
+        /// with --tokenizer: make EVAL/heldout.i32 (`seqs` x `len` tokens) from this text first
+        #[arg(long)]
+        text: Option<PathBuf>,
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
     },
     /// Teacher-force a conversation through decode: per-position log-prob, rank and entropy of each continuation
     /// token, and the probability of ending the reasoning (`</think>`). TSV to stdout.
@@ -893,11 +902,21 @@ fn main() -> Result<()> {
             }
         }
         #[cfg(feature = "cuda")]
-        Cmd::Eval { model, engram, eval, seqs, len, topk, gpu0_gb, gpu1_gb, arena_gb, rank, decode, from } => {
+        Cmd::Eval { model, engram, eval, seqs, len, topk, gpu0_gb, gpu1_gb, arena_gb, rank, decode, from, teacher_out, text, tokenizer } => {
+            if let Some(tf) = &text {
+                let tp = tokenizer.as_ref().ok_or_else(|| anyhow::anyhow!("--text needs --tokenizer"))?;
+                let tok = tokenizers::Tokenizer::from_file(tp).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let ids = tok.encode(std::fs::read_to_string(tf)?, false).map_err(|e| anyhow::anyhow!("{e}"))?.get_ids().to_vec();
+                anyhow::ensure!(ids.len() >= seqs * len, "{}: {} tokens, {seqs} x {len} needed", tf.display(), ids.len());
+                std::fs::create_dir_all(&eval)?;
+                std::fs::write(eval.join("heldout.i32"), ids[..seqs * len].iter().flat_map(|&x| (x as i32).to_le_bytes()).collect::<Vec<u8>>())?;
+                eprintln!("heldout: {seqs} x {len} tokens of {}", tf.display());
+            }
             let rd = |f: &str| std::fs::read(eval.join(f));
             let toks: Vec<u32> = rd("heldout.i32")?.chunks(4).map(|b| i32::from_le_bytes(b.try_into().unwrap()) as u32).collect();
-            let tidx: Vec<i32> = rd("teacher_idx.i32")?.chunks(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
-            let tlp: Vec<f32> = rd("teacher_lp.f32")?.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+            let (mut w_idx, mut w_lp) = (Vec::<u8>::new(), Vec::<u8>::new());
+            let tidx: Vec<i32> = if teacher_out { vec![] } else { rd("teacher_idx.i32")? }.chunks(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect();
+            let tlp: Vec<f32> = if teacher_out { vec![] } else { rd("teacher_lp.f32")? }.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
             let m = load(&model, engram.as_deref())?;
             let mut gm = dsx::gpumodel::GpuModel::with_placement(&m, -1, len + 64, dsx::gpumodel::Placement { gpu0_gb, aux_gb: gpu1_gb, arena_gb, prefill_chunk: len, rank })?;
             let (mut nll, mut kl, mut agree, mut cnt) = (0f64, 0f64, 0usize, 0usize);
@@ -919,6 +938,18 @@ fn main() -> Result<()> {
                     let lse = mx + l.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>().ln();
                     let lq = |i: usize| l[i] as f64 - lse;
                     nll -= lq(seq[p + 1] as usize);
+                    if teacher_out {
+                        let mut ix: Vec<usize> = (0..l.len()).collect();
+                        ix.select_nth_unstable_by(topk - 1, |&a, &b| l[b].total_cmp(&l[a]));
+                        ix.truncate(topk);
+                        ix.sort_unstable_by(|&a, &b| l[b].total_cmp(&l[a]));
+                        for &i in &ix {
+                            w_idx.extend_from_slice(&(i as i32).to_le_bytes());
+                            w_lp.extend_from_slice(&(lq(i) as f32).to_le_bytes());
+                        }
+                        cnt += 1;
+                        continue;
+                    }
                     let row = sq * (len - 1) + p;
                     let (ti, tl) = (&tidx[row * topk..(row + 1) * topk], &tlp[row * topk..(row + 1) * topk]);
                     kl += ti.iter().zip(tl).map(|(&i, &lt)| (lt as f64).exp() * (lt as f64 - lq(i as usize))).sum::<f64>();
@@ -927,6 +958,13 @@ fn main() -> Result<()> {
                     cnt += 1;
                 }
                 eprintln!("seq {sq}: running ppl {:.3} kl {:.4} top1 {:.4} ({:.0} s)", (nll / cnt as f64).exp(), kl / cnt as f64, agree as f64 / cnt as f64, t0.elapsed().as_secs_f64());
+            }
+            if teacher_out {
+                anyhow::ensure!(from <= 1, "--teacher-out writes every position: leave --from at 0");
+                std::fs::write(eval.join("teacher_idx.i32"), &w_idx)?;
+                std::fs::write(eval.join("teacher_lp.f32"), &w_lp)?;
+                println!("{{\"teacher_out\": \"{}\", \"positions\": {cnt}, \"topk\": {topk}}}", eval.display());
+                return Ok(());
             }
             if decode {
                 println!("teacher-forced decode {steps} steps in {t_steps:.2} s ({:.2} tok/s)", steps as f64 / t_steps);

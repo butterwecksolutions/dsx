@@ -372,9 +372,12 @@ impl<'m> GpuModel<'m> {
         }
         prefill::load_optional_kernels(&g, &mut k)?;
         let c = &m.cfg;
-        let dense_q6 = std::env::var_os("DSX_DENSE_Q6").is_some();
-        let up = |w: &Mat| -> Result<DMat> {
-            if w.ty == GType::Q8_0 && dense_q6 && w.cols % 256 == 0 {
+        // DSX_DENSE_Q6: Q8_0 dense matrices requantized to 6 bits at load; `1` (or `all`) every one, else a comma list of
+        // q_a, q_b, kv, o_a, o_b, sh (the shared expert's three), head
+        let dense_q6: Option<Vec<String>> = std::env::var("DSX_DENSE_Q6").ok().map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
+        let q6_for = |tag: &str| dense_q6.as_ref().is_some_and(|v| v.iter().any(|s| s == tag || s == "1" || s == "all" || s.is_empty()));
+        let upq = |w: &Mat, tag: &str| -> Result<DMat> {
+            if w.ty == GType::Q8_0 && q6_for(tag) && w.cols % 256 == 0 {
                 // decode the Q8_0 rows, requantize to 6 bits (ggml's Q6_K algorithm), upload as planes
                 let (rows, k) = (w.rows, w.cols);
                 let (mut lo, mut hi, mut sc, mut d) = (vec![0u8; rows * k / 2], vec![0u8; rows * k / 4], vec![0i8; rows * k / 16], vec![0u16; rows * k / 256]);
@@ -413,6 +416,7 @@ impl<'m> GpuModel<'m> {
             let scale = if w.scale_bytes().is_empty() { None } else { Some(g.upload(w.scale_bytes())?) };
             Ok(DMat { buf: g.upload(w.bytes())?, scale, ty: w.ty, rows: w.rows, cols: w.cols, act_fp8: w.act_fp8, q8r: false, q6: None })
         };
+        let up = |w: &Mat| upq(w, "");
         let upo = |w: &Option<Mat>| -> Result<Option<DMat>> { w.as_ref().map(up).transpose() };
         // DSX_ENGRAM_FP8=1: an F16 engram wkv goes up as FP8 + 32x32 E8M0 scales (the checkpoint's layout), half the
         // bytes for its bandwidth-bound decode GEMV; only when the conversion is exact (the F16 came from that FP8)
@@ -445,13 +449,13 @@ impl<'m> GpuModel<'m> {
             let ratio = l.ratio.max(1);
             let is_src = c.kv_sources.contains(&l.id);
             layers.push(DLayer {
-                q_a: up(&l.q_a)?,
+                q_a: upq(&l.q_a, "q_a")?,
                 q_a_norm: f32buf(&g, &l.q_a_norm)?,
-                q_b: up(&l.q_b)?,
-                kv: up(&l.kv)?,
+                q_b: upq(&l.q_b, "q_b")?,
+                kv: upq(&l.kv, "kv")?,
                 kv_norm: f32buf(&g, &l.kv_norm)?,
-                o_a: up(&l.o_a)?,
-                o_b: up(&l.o_b)?,
+                o_a: upq(&l.o_a, "o_a")?,
+                o_b: upq(&l.o_b, "o_b")?,
                 sinks: f32buf(&g, &l.sinks)?,
                 attn_norm: f32buf(&g, &l.attn_norm)?,
                 ffn_norm: f32buf(&g, &l.ffn_norm)?,
@@ -468,9 +472,9 @@ impl<'m> GpuModel<'m> {
                 gate_w: bf16mat(&l.gate_w, c.n_experts)?,
                 gate_bias: f32buf(&g, &l.gate_bias)?,
                 gate_bias_vl: l.gate_bias_vl.as_ref().map(|b| f32buf(&g, b)).transpose()?,
-                sh_gate: up(&l.sh_gate)?,
-                sh_up: up(&l.sh_up)?,
-                sh_down: up(&l.sh_down)?,
+                sh_gate: upq(&l.sh_gate, "sh")?,
+                sh_up: upq(&l.sh_up, "sh")?,
+                sh_down: upq(&l.sh_down, "sh")?,
                 engram_kv: up_engram(&l.engram_kv)?,
                 engram_qk: upv(&l.engram_qk)?,
                 window: bf16zeros(c.window * c.head_dim)?,
@@ -488,7 +492,7 @@ impl<'m> GpuModel<'m> {
         let d = c.dim;
         let fz = |n: usize| g.alloc_zeroed(n * 4);
         let gm = GpuModel {
-            head: up(&m.head)?,
+            head: upq(&m.head, "head")?,
             out_norm: f32buf(&g, &m.out_norm)?,
             freqs: (f32buf(&g, &m.ropes.0.freqs)?, f32buf(&g, &m.ropes.1.freqs)?),
             h: fz(c.hc * d)?,
